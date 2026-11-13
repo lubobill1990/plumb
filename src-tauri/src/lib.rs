@@ -82,7 +82,7 @@ struct Platform {
     windows_build: Option<u32>,
     profiles: Vec<Profile>,
     home: Option<String>,
-    /// Directory passed on the command line (`terminal.exe D:\proj`).
+    /// Directory passed on the command line (`plumb.exe D:\proj`).
     initial_dir: Option<String>,
 }
 
@@ -410,7 +410,7 @@ fn pty_attach(window: Window, state: State<'_, PtyState>, id: u32, on_event: Cha
 async fn open_window(app: AppHandle, state: State<'_, PtyState>, attach: Option<u32>, width: f64, height: f64) -> Result<(), String> {
     let n = state.next_window.fetch_add(1, Ordering::Relaxed) + 1;
     let mut b = WebviewWindowBuilder::new(&app, format!("win-{n}"), WebviewUrl::App("index.html".into()))
-        .title("Terminal")
+        .title("Plumb")
         .inner_size(width, height)
         .min_inner_size(400.0, 240.0)
         .decorations(false)

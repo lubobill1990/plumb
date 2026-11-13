@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Terminal",
+  "productName": "Plumb",
   "version": "0.1.0",
-  "identifier": "com.local.xterm-terminal",
+  "identifier": "com.lubobill1990.plumb",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:5273",
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Terminal",
+        "title": "Plumb",
         "width": 1200,
         "height": 760,
         "minWidth": 400,

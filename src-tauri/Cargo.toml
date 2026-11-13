@@ -1,10 +1,11 @@
 [package]
-name = "terminal"
+name = "plumb"
+description = "A Windows terminal for AI coding agents that keeps their TUIs aligned"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "terminal_lib"
+name = "plumb_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
