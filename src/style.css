@@ -109,7 +109,8 @@ select.flat option { background: #2b2b2b; }
 
 /* ---- terminals ---- */
 #terminals { flex: 1; position: relative; min-height: 0; }
-.term-host { position: absolute; inset: 6px 0 0 10px; display: none; }
+/* same padding as Windows Terminal (8px; right side left to the scrollbar) */
+.term-host { position: absolute; inset: 8px 0 8px 8px; display: none; }
 .term-host.active { display: block; }
 
 /* thin overlay-style scrollbar */
