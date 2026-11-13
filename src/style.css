@@ -19,7 +19,7 @@ body { display: flex; flex-direction: column; }
   user-select: none;
   flex: none;
 }
-#tabs { display: flex; gap: 1px; min-width: 0; overflow: hidden; height: 100%; align-items: flex-end; }
+#tabs { display: flex; gap: 1px; min-width: 0; overflow: hidden; height: 100%; align-items: flex-end; padding: 0 8px; margin-left: -6px; }
 .tab {
   position: relative;
   display: flex;
@@ -36,7 +36,19 @@ body { display: flex; flex-direction: column; }
   flex: 0 1 auto;
 }
 .tab:hover { background: #333; }
-.tab.active { background: #1e1e1e; color: #fff; }
+.tab.active { --tab-bg: #1e1e1e; background: var(--tab-bg); color: #fff; z-index: 1; }
+/* flared bottom corners: the active tab flows into the terminal below (Chrome / Windows Terminal) */
+.tab.active::before, .tab.active::after {
+  content: "";
+  position: absolute;
+  bottom: 0;
+  width: 8px;
+  height: 8px;
+  pointer-events: none;
+}
+.tab.active::before { left: -8px; background: radial-gradient(circle at 0 0, transparent 7.5px, var(--tab-bg) 8px); }
+.tab.active::after { right: -8px; background: radial-gradient(circle at 100% 0, transparent 7.5px, var(--tab-bg) 8px); }
+.tab.lifting::before, .tab.lifting::after { display: none; }
 /* being dragged inside the strip: follows the pointer */
 .tab.lifting { z-index: 2; background: #1e1e1e; color: #fff; box-shadow: 0 0 0 1px #3b8eea inset, 0 2px 8px rgba(0,0,0,.5); }
 /* torn out: leave a hollow slot behind */
@@ -179,7 +191,7 @@ select.flat option { background: #2b2b2b; }
 
 /* ---- tab colors ---- */
 .tab.colored { box-shadow: inset 0 3px var(--tab-color); }
-.tab.colored.active { background: color-mix(in srgb, var(--tab-color) 22%, #1e1e1e); }
+.tab.colored.active { --tab-bg: color-mix(in srgb, var(--tab-color) 22%, #1e1e1e); }
 .tab .rename {
   flex: 1; min-width: 0; height: 20px; padding: 0 4px;
   background: #1e1e1e; color: #fff; border: 1px solid #3b8eea; border-radius: 3px;
