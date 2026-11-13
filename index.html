@@ -10,10 +10,14 @@
       <button id="new-tab" class="flat" title="新标签 (Ctrl+Shift+T)">＋</button>
       <button id="launch-menu" class="flat" title="选择配置和启动目录">&#xE70D;</button>
       <div class="spacer" data-tauri-drag-region></div>
-      <label class="flat" title="检测到进入/退出 TUI 程序（alt-screen、bracketed-paste 切换）时自动重绘">
-        <input type="checkbox" id="auto-repaint" /> 自动重绘
-      </label>
-      <button id="repaint" class="flat" title="强制重绘 (Ctrl+Shift+R)">⟳</button>
+      <button id="repaint" class="flat icon" title="重绘画面 (Ctrl+Shift+R)" aria-label="重绘画面">
+        <svg viewBox="0 0 16 16" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M7 13.5H3A1.5 1.5 0 0 1 1.5 12V4A1.5 1.5 0 0 1 3 2.5h10A1.5 1.5 0 0 1 14.5 4v2.5" />
+          <path d="M4 5.5h4M4 8h2.5" />
+          <path d="M14.5 11.5a3 3 0 1 1-3-3" />
+          <path d="M10.6 7.2l1.3 1.3-1.3 1.3" />
+        </svg>
+      </button>
       <div id="win-controls">
         <button id="win-min" title="最小化">&#xE921;</button>
         <button id="win-max" title="最大化">&#xE922;</button>

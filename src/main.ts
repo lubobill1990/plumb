@@ -52,18 +52,13 @@ const theme: ITheme = {
 
 // DEC private modes that mark "a TUI app is starting / stopping":
 // 1049/1047/47 = alternate screen, 2004 = bracketed paste (Claude Code toggles it on enter/exit).
-const TUI_MODES = new Set([47, 1047, 1049, 2004]);
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
 const titlebar = $<HTMLDivElement>("#titlebar");
 const tabsEl = $<HTMLDivElement>("#tabs");
 const termsEl = $<HTMLDivElement>("#terminals");
-const autoRepaintEl = $<HTMLInputElement>("#auto-repaint");
 const appWindow = getCurrentWindow();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-autoRepaintEl.checked = localStorage.getItem("autoRepaint") !== "0";
-autoRepaintEl.onchange = () => localStorage.setItem("autoRepaint", autoRepaintEl.checked ? "1" : "0");
 
 let platform: Platform;
 const tabs: Tab[] = [];
@@ -80,7 +75,6 @@ class Tab {
   id: number | null = null;
   exited = false;
   title: string;
-  private repaintTimer?: number;
 
   constructor(public profile: Profile, public cwd: string | null = null) {
     this.title = profile.name;
@@ -158,13 +152,6 @@ class Tab {
       } catch { /* ignore malformed */ }
       return true;
     });
-
-    for (const final of ["h", "l"]) {
-      this.term.parser.registerCsiHandler({ prefix: "?", final }, (params) => {
-        if (params.some((p) => TUI_MODES.has(Array.isArray(p) ? p[0] : p))) this.scheduleRepaint();
-        return false; // let xterm handle the sequence normally
-      });
-    }
   }
 
   setTitle(t: string) {
@@ -307,13 +294,6 @@ ${this.cwd}` : this.title;
     return true;
   }
 
-  scheduleRepaint() {
-    if (!autoRepaintEl.checked) return;
-    clearTimeout(this.repaintTimer);
-    // Wait until the app has finished its enter/exit output burst.
-    this.repaintTimer = window.setTimeout(() => this.repaint(), 250);
-  }
-
   /**
    * What maximize/minimize does by accident, done on purpose: briefly change the PTY
    * width and restore it. ConPTY re-renders its viewport and the app (Claude Code /
@@ -338,7 +318,6 @@ ${this.cwd}` : this.title;
 
   /** Remove the tab from this window (does not touch the backend session). */
   dispose() {
-    clearTimeout(this.repaintTimer);
     this.term.dispose();
     this.host.remove();
     this.tabBtn.remove();
