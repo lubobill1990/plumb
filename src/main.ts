@@ -13,6 +13,9 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
+import { AGENT_ICONS } from "./icons";
+import pwshIcon from "./assets/pwsh.png";
+import cmdIcon from "./assets/cmd.png";
 
 interface Profile {
   id: string;
@@ -97,7 +100,7 @@ class Tab {
 
     this.tabBtn = document.createElement("div");
     this.tabBtn.className = "tab";
-    this.tabBtn.innerHTML = `<span class="title"></span><span class="dir"></span><span class="close" title="关闭 (Ctrl+Shift+W)">✕</span>`;
+    this.tabBtn.innerHTML = `<span class="ticon"></span><span class="title"></span><span class="dir"></span><span class="close" title="关闭 (Ctrl+Shift+W)">✕</span>`;
     this.tabBtn.onpointerdown = (e) => {
       if (e.button !== 0) return;
       if ((e.target as HTMLElement).classList.contains("close")) return;
@@ -114,6 +117,7 @@ class Tab {
     };
     tabsEl.appendChild(this.tabBtn);
     this.setTitle(profile.name);
+    this.showIcon();
 
     this.term = new Terminal({
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Sarasa Mono SC", "Microsoft YaHei UI", monospace',
@@ -204,6 +208,10 @@ class Tab {
     this.showTitle();
   }
 
+  showIcon() {
+    (this.tabBtn.querySelector(".ticon") as HTMLElement).replaceChildren(profileIcon(this.profile));
+  }
+
   setCustomTitle(t: string | null) {
     this.customTitle = t?.trim() || null;
     this.showTitle();
@@ -284,6 +292,7 @@ ${this.cwd}` : this.title;
       else if (ev.type === "snapshot") {
         const s = ev.data;
         this.profile = s.profile;
+        this.showIcon();
         if (s.cwd) this.setCwd(s.cwd);
         this.customTitle = s.customTitle ?? null;
         this.setTitle(s.title);
@@ -912,6 +921,25 @@ function defaultProfile(): Profile {
   return platform.profiles.find((p) => p.id === id) ?? platform.profiles[0];
 }
 
+/**
+ * The profile's real icon: the exe's own icon for PowerShell / CMD (what Windows
+ * Terminal shows), the brand mark for agent CLIs, a neutral glyph otherwise.
+ */
+function profileIcon(p: Profile): HTMLElement {
+  const box = el("span", "picon");
+  const img = p.id === "pwsh" ? pwshIcon : p.id === "cmd" ? cmdIcon : null;
+  const brand = p.command ? AGENT_ICONS[p.command] : undefined;
+  if (img) {
+    box.append(Object.assign(document.createElement("img"), { src: img, alt: "", draggable: false }));
+  } else if (brand) {
+    box.innerHTML = `<svg viewBox="0 0 24 24" fill="${brand.color}" aria-hidden="true"><path d="${brand.path}"/></svg>`;
+  } else {
+    box.classList.add("fallback");
+    box.textContent = p.kind === "agent" ? "✳" : "›";
+  }
+  return box;
+}
+
 function baseName(path: string) {
   return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
 }
@@ -992,7 +1020,7 @@ function renderLauncher() {
     launcher.append(el("div", "menu-label", label));
     for (const p of list) {
       const row = el("div", "menu-item");
-      row.append(el("span", "icon", p.kind === "agent" ? "✳" : "›"), el("span", "grow", p.name));
+      row.append(profileIcon(p), el("span", "grow", p.name));
       if (p.command) row.append(el("span", "hint", p.command));
       if (p.id === def.id) row.append(el("span", "badge", "默认"));
       row.title = `在 ${launchDir ?? "~"} 中启动 ${p.name}`;
