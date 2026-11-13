@@ -4,12 +4,13 @@ import { Unicode11Addon } from "@xterm/addon-unicode11";
 import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SerializeAddon } from "@xterm/addon-serialize";
+import { SearchAddon } from "@xterm/addon-search";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 
@@ -37,6 +38,8 @@ interface Snapshot {
   profile: Profile;
   exited: boolean;
   cwd: string | null;
+  customTitle?: string | null;
+  color?: string | null;
 }
 type PtyEvent =
   | { type: "data"; data: string }
@@ -50,8 +53,10 @@ const theme: ITheme = {
   selectionBackground: "#264f78",
 };
 
-// DEC private modes that mark "a TUI app is starting / stopping":
-// 1049/1047/47 = alternate screen, 2004 = bracketed paste (Claude Code toggles it on enter/exit).
+const FONT_DEFAULT = 14;
+const FONT_MIN = 8;
+const FONT_MAX = 40;
+let fontSize = Number(localStorage.getItem("fontSize")) || FONT_DEFAULT;
 
 const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
 const titlebar = $<HTMLDivElement>("#titlebar");
@@ -68,16 +73,24 @@ class Tab {
   term: Terminal;
   fit = new FitAddon();
   serializer = new SerializeAddon();
+  search = new SearchAddon();
   webgl?: WebglAddon;
   host: HTMLDivElement;
   tabBtn: HTMLDivElement;
   /** Backend session id. Kept after the process exits, until the tab is closed. */
   id: number | null = null;
   exited = false;
+  /** What the tab shows: the user's name for it, else what the app set. */
   title: string;
+  /** Title set by the running app (OSC 0/2), or the profile name. */
+  autoTitle: string;
+  /** "Rename tab" — wins over the app's title until cleared. */
+  customTitle: string | null = null;
+  color: string | null = null;
+  private lastInput = { data: "", at: 0 };
 
   constructor(public profile: Profile, public cwd: string | null = null) {
-    this.title = profile.name;
+    this.title = this.autoTitle = profile.name;
     this.host = document.createElement("div");
     this.host.className = "term-host";
     termsEl.appendChild(this.host);
@@ -95,12 +108,16 @@ class Tab {
       if ((e.target as HTMLElement).classList.contains("close")) this.close();
     };
     this.tabBtn.onauxclick = (e) => { if (e.button === 1) this.close(); };
+    this.tabBtn.oncontextmenu = (e) => {
+      e.preventDefault();
+      openTabMenu(this, e.clientX, e.clientY);
+    };
     tabsEl.appendChild(this.tabBtn);
     this.setTitle(profile.name);
 
     this.term = new Terminal({
       fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Sarasa Mono SC", "Microsoft YaHei UI", monospace',
-      fontSize: 14,
+      fontSize,
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,
@@ -119,8 +136,26 @@ class Tab {
     this.term.unicode.activeVersion = "11";
     this.term.loadAddon(this.fit);
     this.term.loadAddon(this.serializer);
+    this.term.loadAddon(this.search);
     this.term.loadAddon(new WebLinksAddon((_e, uri) => void openUrl(uri)));
     this.term.open(this.host);
+    this.guardIme();
+    this.search.onDidChangeResults(({ resultIndex, resultCount }) => {
+      if (this !== active) return;
+      findCount.textContent = resultCount ? `${resultIndex + 1}/${resultCount}` : "无结果";
+    });
+
+    // Right click: copy the selection, or paste when nothing is selected (Windows Terminal).
+    this.host.addEventListener("contextmenu", (e) => {
+      e.preventDefault();
+      if (this.term.hasSelection()) {
+        void navigator.clipboard.writeText(this.term.getSelection());
+        this.term.clearSelection();
+      } else {
+        void navigator.clipboard.readText().then((t) => t && this.term.paste(t)).catch(() => {});
+      }
+      this.term.focus();
+    });
     try {
       this.webgl = new WebglAddon();
       this.webgl.onContextLoss(() => { this.webgl?.dispose(); this.webgl = undefined; });
@@ -132,6 +167,13 @@ class Tab {
     this.term.onTitleChange((t) => this.setTitle(t || this.profile.name));
     this.term.onData((data) => {
       if (this.exited) return this.close();
+      // xterm 5.5 + an active IME: a punctuation key (keyCode 229, no composition) is sent
+      // twice — once from the textarea diff (CompositionHelper, setTimeout 0) and once from
+      // the `input` event. The copies land a few ms apart; a human can't repeat that fast.
+      const now = performance.now();
+      const dup = data === this.lastInput.data && now - this.lastInput.at < 30 && /[^\x00-\x7f]/.test(data);
+      this.lastInput = { data, at: now };
+      if (dup) return;
       this.write(data);
     });
     this.term.onResize(({ cols, rows }) => {
@@ -158,10 +200,67 @@ class Tab {
     // "C:\Program Files\PowerShell\7\pwsh.exe" -> "pwsh"
     const exe = /^[a-z]:\\.*\\([^\\]+)\.exe$/i.exec(t);
     if (exe) t = exe[1];
+    this.autoTitle = t;
+    this.showTitle();
+  }
+
+  setCustomTitle(t: string | null) {
+    this.customTitle = t?.trim() || null;
+    this.showTitle();
+  }
+
+  private showTitle() {
+    const t = this.customTitle ?? this.autoTitle;
     this.title = t;
     (this.tabBtn.querySelector(".title") as HTMLElement).textContent = t;
     this.renderTab();
     if (this === active) void appWindow.setTitle(t);
+  }
+
+  setColor(c: string | null) {
+    this.color = c;
+    this.tabBtn.classList.toggle("colored", c !== null);
+    if (c) this.tabBtn.style.setProperty("--tab-color", c);
+    else this.tabBtn.style.removeProperty("--tab-color");
+  }
+
+  /**
+   * Two IME fixes. xterm parks its hidden textarea and the composition preview (the raw
+   * pinyin) at the cursor. Near the right edge a long preview overflows, and the browser
+   * scrolls the terminal sideways to keep the focused textarea in view — the whole screen
+   * jumps left. CSS `overflow: clip` stops that; this undoes any scroll that still happens
+   * and slides the preview left so it stays fully visible.
+   */
+  private guardIme() {
+    const viewport = this.host.querySelector(".xterm-viewport");
+    this.host.addEventListener("scroll", (e) => {
+      const t = e.target as HTMLElement;
+      if (t !== viewport && t.scrollLeft) t.scrollLeft = 0;
+      if (t !== viewport && t.scrollTop) t.scrollTop = 0;
+    }, true);
+    const view = this.host.querySelector<HTMLElement>(".composition-view");
+    if (!view) return;
+    new MutationObserver(() => {
+      if (!view.classList.contains("active")) return;
+      const max = this.host.clientWidth - view.offsetWidth;
+      const left = parseFloat(view.style.left) || 0;
+      if (left > max) view.style.left = `${Math.max(0, max)}px`;
+    }).observe(view, { attributes: true, attributeFilter: ["style", "class"], childList: true, characterData: true, subtree: true });
+  }
+
+  /** Whole buffer (scrollback + screen) as plain text. */
+  text() {
+    const buf = this.term.buffer.active;
+    const lines: string[] = [];
+    for (let i = 0; i < buf.length; i++) {
+      const line = buf.getLine(i);
+      if (!line) continue;
+      // a wrapped row continues the previous line
+      if (line.isWrapped && lines.length) lines[lines.length - 1] += line.translateToString(true);
+      else lines.push(line.translateToString(true));
+    }
+    while (lines.length && !lines[lines.length - 1]) lines.pop();
+    return lines.join("\r\n") + "\r\n";
   }
 
   setCwd(dir: string) {
@@ -186,7 +285,9 @@ ${this.cwd}` : this.title;
         const s = ev.data;
         this.profile = s.profile;
         if (s.cwd) this.setCwd(s.cwd);
+        this.customTitle = s.customTitle ?? null;
         this.setTitle(s.title);
+        this.setColor(s.color ?? null);
         this.exited = s.exited;
         // replay at the size it was captured at, then fit to this window and let
         // ConPTY / the app redraw at the new size
@@ -242,10 +343,12 @@ ${this.cwd}` : this.title;
       // not in the public API
       cursorHidden: !!(this.term as unknown as { _core?: { coreService?: { isCursorHidden?: boolean } } })
         ._core?.coreService?.isCursorHidden,
-      title: this.title,
+      title: this.autoTitle,
       profile: this.profile,
       exited: this.exited,
       cwd: this.cwd,
+      customTitle: this.customTitle,
+      color: this.color,
     };
     await invoke("pty_stash", { id, snapshot });
     this.id = null;
@@ -273,6 +376,12 @@ ${this.cwd}` : this.title;
     // Ctrl+V / Ctrl+Shift+V: let the browser fire a native paste event (xterm handles it,
     // incl. bracketed paste)
     if (ctrl && key === "v") return false;
+    // Ctrl+= / Ctrl+- / Ctrl+0: font size (also Ctrl+wheel)
+    if (ctrl && !e.shiftKey && ["=", "+", "-", "0"].includes(e.key)) {
+      if (down) setFontSize(e.key === "0" ? FONT_DEFAULT : fontSize + (e.key === "-" ? -1 : 1));
+      e.preventDefault();
+      return false;
+    }
     // Shift+Enter: newline inside Claude Code's prompt (sent as Meta+Enter)
     if (e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Enter") {
       if (down) this.write("\x1b\r");
@@ -284,6 +393,8 @@ ${this.cwd}` : this.title;
         r: () => this.repaint(),
         t: () => void newTab(),
         w: () => this.close(),
+        f: () => openFind(),
+        d: () => void duplicateTab(this),
       };
       if (actions[key]) {
         if (down) actions[key]();
@@ -347,6 +458,7 @@ ${this.cwd}` : this.title;
 
 function activate(tab: Tab) {
   if (active === tab) return;
+  active?.search.clearDecorations();
   for (const t of tabs) {
     const on = t === tab;
     t.host.classList.toggle("active", on);
@@ -356,7 +468,8 @@ function activate(tab: Tab) {
   void appWindow.setTitle(tab.title);
   requestAnimationFrame(() => {
     tab.fitNow();
-    tab.term.focus();
+    if (findBar.hidden) tab.term.focus();
+    else runFind(false, true);
   });
 }
 
@@ -556,6 +669,236 @@ window.addEventListener("keydown", (e) => {
   // shortcuts when the terminal itself doesn't have focus
   if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") { e.preventDefault(); void newTab(); }
 });
+
+// No WebView context menu (Back / Reload / Inspect ...) anywhere; text fields keep theirs.
+document.addEventListener("contextmenu", (e) => {
+  if (!(e.target instanceof HTMLInputElement)) e.preventDefault();
+});
+
+// ---------------------------------------------------------------------------
+// font size: Ctrl+wheel, Ctrl+= / Ctrl+- / Ctrl+0 — all tabs, remembered
+// ---------------------------------------------------------------------------
+function setFontSize(size: number) {
+  size = Math.min(FONT_MAX, Math.max(FONT_MIN, Math.round(size)));
+  if (size === fontSize) return;
+  fontSize = size;
+  localStorage.setItem("fontSize", String(size));
+  for (const t of tabs) {
+    t.term.options.fontSize = size;
+    t.fitNow();
+  }
+}
+termsEl.addEventListener("wheel", (e) => {
+  if (!e.ctrlKey) return;
+  e.preventDefault();
+  e.stopPropagation(); // don't let xterm scroll the buffer
+  setFontSize(fontSize + (e.deltaY < 0 ? 1 : -1));
+}, { passive: false, capture: true });
+
+// ---------------------------------------------------------------------------
+// tab context menu
+// ---------------------------------------------------------------------------
+const TAB_COLORS = ["#c42b1c", "#ca5010", "#c19c00", "#13a10e", "#0f7b8a", "#0063b1", "#6b69d6", "#b146c2", "#7a7574"];
+const tabMenu = Object.assign(document.createElement("div"), { className: "menu tab-menu", hidden: true });
+document.body.appendChild(tabMenu);
+
+function menuItem(glyph: string, label: string, run: () => void, opts: { hint?: string; disabled?: boolean } = {}) {
+  const row = el("div", "menu-item" + (opts.disabled ? " disabled" : ""));
+  row.append(el("span", "glyph", glyph), el("span", "grow", label));
+  if (opts.hint) row.append(el("span", "hint", opts.hint));
+  if (!opts.disabled) row.onclick = () => { closeTabMenu(); run(); };
+  return row;
+}
+
+function openTabMenu(tab: Tab, x: number, y: number) {
+  closeLauncher();
+  const i = tabs.indexOf(tab);
+  const swatches = el("div", "swatches");
+  for (const c of [null, ...TAB_COLORS]) {
+    const s = el("span", "swatch" + (c === tab.color ? " selected" : "") + (c ? "" : " none"));
+    if (c) s.style.background = c;
+    s.title = c ?? "无颜色";
+    s.onclick = () => { tab.setColor(c); closeTabMenu(); };
+    swatches.append(s);
+  }
+  const colorRow = el("div", "menu-item static");
+  colorRow.append(el("span", "glyph", "\uE790"), swatches);
+
+  tabMenu.replaceChildren(
+    colorRow,
+    menuItem("\uE8AC", "重命名标签", () => renameTab(tab)),
+    menuItem("\uE8C8", "复制标签", () => void duplicateTab(tab), { hint: "Ctrl+Shift+D" }),
+    el("div", "menu-sep"),
+    menuItem("\uE8A7", "移到新窗口", () => void moveToNewWindow(tab), { disabled: tabs.length < 2 }),
+    menuItem("\uE76B", "左移", () => moveTab(tab, -1), { disabled: i <= 0 }),
+    menuItem("\uE76C", "右移", () => moveTab(tab, 1), { disabled: i >= tabs.length - 1 }),
+    el("div", "menu-sep"),
+    menuItem("\uE74E", "导出文本…", () => void exportText(tab)),
+    menuItem("\uE721", "查找", () => { activate(tab); openFind(); }, { hint: "Ctrl+Shift+F" }),
+    el("div", "menu-sep"),
+    menuItem("", "关闭其他标签", () => closeTabs(tabs.filter((t) => t !== tab)), { disabled: tabs.length < 2 }),
+    menuItem("", "关闭右侧标签", () => closeTabs(tabs.slice(i + 1)), { disabled: i >= tabs.length - 1 }),
+    menuItem("\uE711", "关闭标签", () => tab.close(), { hint: "Ctrl+Shift+W" }),
+  );
+  tabMenu.hidden = false;
+  tabMenu.style.left = `${Math.max(4, Math.min(x, innerWidth - tabMenu.offsetWidth - 4))}px`;
+  tabMenu.style.top = `${Math.max(4, Math.min(y, innerHeight - tabMenu.offsetHeight - 4))}px`;
+}
+
+function closeTabMenu() {
+  tabMenu.hidden = true;
+}
+
+function renameTab(tab: Tab) {
+  activate(tab);
+  const span = tab.tabBtn.querySelector(".title") as HTMLElement;
+  const input = Object.assign(document.createElement("input"), { className: "rename", value: tab.title });
+  input.placeholder = tab.autoTitle;
+  span.replaceWith(input);
+  input.focus();
+  input.select();
+  let done = false;
+  const finish = (commit: boolean) => {
+    if (done) return;
+    done = true;
+    input.replaceWith(span);
+    // empty = go back to the title the app sets
+    if (commit) tab.setCustomTitle(input.value === tab.autoTitle ? null : input.value);
+    tab.term.focus();
+  };
+  input.onkeydown = (e) => {
+    e.stopPropagation();
+    if (e.key === "Enter") finish(true);
+    if (e.key === "Escape") finish(false);
+  };
+  input.onblur = () => finish(true);
+  input.onpointerdown = (e) => e.stopPropagation(); // no tab drag while editing
+}
+
+async function duplicateTab(tab: Tab) {
+  await newTab(tab.profile, tab.cwd);
+  const copy = tabs[tabs.length - 1];
+  copy.setColor(tab.color);
+  // place it right after the original
+  tabs.splice(tabs.indexOf(copy), 1);
+  tabs.splice(tabs.indexOf(tab) + 1, 0, copy);
+  tabsEl.append(...tabs.map((t) => t.tabBtn));
+}
+
+function moveTab(tab: Tab, delta: number) {
+  const i = tabs.indexOf(tab);
+  const j = i + delta;
+  if (i < 0 || j < 0 || j >= tabs.length) return;
+  [tabs[i], tabs[j]] = [tabs[j], tabs[i]];
+  tabsEl.append(...tabs.map((t) => t.tabBtn));
+}
+
+async function moveToNewWindow(tab: Tab) {
+  if (tabs.length < 2) return;
+  const { innerWidth: width, innerHeight: height } = window;
+  const id = await tab.detach();
+  if (id !== null) await invoke("open_window", { attach: id, width, height });
+  tab.dispose();
+}
+
+function closeTabs(list: Tab[]) {
+  for (const t of [...list]) t.close();
+}
+
+async function exportText(tab: Tab) {
+  const stamp = new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-");
+  const name = `${tab.title.replace(/[\\/:*?"<>|]+/g, "_").slice(0, 60) || "terminal"}-${stamp}.txt`;
+  const dir = tab.cwd ?? platform.home;
+  const path = await saveDialog({
+    title: "导出文本",
+    defaultPath: dir ? `${dir}\\${name}` : name,
+    filters: [{ name: "文本", extensions: ["txt", "log"] }],
+  });
+  if (path) await invoke("write_text_file", { path, contents: tab.text() }).catch((e) => alert(`导出失败：${e}`));
+  tab.term.focus();
+}
+
+document.addEventListener("pointerdown", (e) => {
+  if (!tabMenu.hidden && !tabMenu.contains(e.target as Node)) closeTabMenu();
+}, true);
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !tabMenu.hidden) closeTabMenu();
+});
+window.addEventListener("blur", closeTabMenu);
+
+// ---------------------------------------------------------------------------
+// find bar (Ctrl+Shift+F)
+// ---------------------------------------------------------------------------
+const findBar = Object.assign(document.createElement("div"), { id: "find-bar", hidden: true });
+findBar.innerHTML = `
+  <input class="find-input" placeholder="查找" spellcheck="false" />
+  <span class="find-count"></span>
+  <button class="find-btn" data-act="prev" title="上一个 (Shift+Enter)">&#xE70E;</button>
+  <button class="find-btn" data-act="next" title="下一个 (Enter)">&#xE70D;</button>
+  <button class="find-btn toggle" data-act="case" title="区分大小写">Aa</button>
+  <button class="find-btn toggle" data-act="regex" title="正则表达式">.*</button>
+  <button class="find-btn" data-act="close" title="关闭 (Esc)">&#xE8BB;</button>`;
+termsEl.appendChild(findBar);
+const findInput = findBar.querySelector<HTMLInputElement>(".find-input")!;
+const findCount = findBar.querySelector<HTMLElement>(".find-count")!;
+const findOpts = { caseSensitive: false, regex: false };
+const searchDecorations = {
+  matchBackground: "#515c6a",
+  matchOverviewRuler: "#d18616",
+  activeMatchBackground: "#d18616",
+  activeMatchColorOverviewRuler: "#d18616",
+};
+
+function runFind(backwards = false, incremental = false) {
+  const tab = active;
+  if (!tab) return;
+  const q = findInput.value;
+  if (!q) {
+    tab.search.clearDecorations();
+    findCount.textContent = "";
+    return;
+  }
+  const opts = { ...findOpts, incremental, decorations: searchDecorations };
+  if (backwards) tab.search.findPrevious(q, opts);
+  else tab.search.findNext(q, opts);
+}
+
+function openFind() {
+  findBar.hidden = false;
+  const sel = active?.term.getSelection();
+  if (sel && !sel.includes("\n")) findInput.value = sel;
+  findInput.focus();
+  findInput.select();
+  if (findInput.value) runFind(false, true);
+}
+
+function closeFind() {
+  findBar.hidden = true;
+  for (const t of tabs) t.search.clearDecorations();
+  findCount.textContent = "";
+  active?.term.focus();
+}
+
+findInput.oninput = () => runFind(false, true);
+findInput.onkeydown = (e) => {
+  e.stopPropagation();
+  if (e.key === "Enter") { e.preventDefault(); runFind(e.shiftKey); }
+  if (e.key === "Escape") closeFind();
+};
+findBar.onclick = (e) => {
+  const act = (e.target as HTMLElement).closest<HTMLElement>(".find-btn")?.dataset.act;
+  if (!act) return;
+  if (act === "prev") runFind(true);
+  if (act === "next") runFind(false);
+  if (act === "case" || act === "regex") {
+    const k = act === "case" ? "caseSensitive" : "regex";
+    findOpts[k] = !findOpts[k];
+    (e.target as HTMLElement).closest(".find-btn")!.classList.toggle("on", findOpts[k]);
+    runFind(false, true);
+  }
+  if (act === "close") return closeFind();
+  findInput.focus();
+};
 
 // ---------------------------------------------------------------------------
 // launcher: pick a profile (shell / agent CLI) and the directory to start in

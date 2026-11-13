@@ -170,3 +170,63 @@ select.flat option { background: #2b2b2b; }
 }
 .dir-item.selected .radio { border-color: #3b8eea; background: radial-gradient(#3b8eea 45%, transparent 50%); }
 .dir-item.selected { color: #fff; }
+
+/* ---- IME: never let the terminal scroll sideways ----
+   overflow: clip (unlike hidden) is not a scroll container, so the browser cannot scroll
+   it to bring the IME textarea / composition preview into view. */
+#terminals, .term-host, .term-host .xterm, .term-host .xterm-screen { overflow: clip; }
+.xterm .composition-view { white-space: nowrap; }
+
+/* ---- tab colors ---- */
+.tab.colored { box-shadow: inset 0 3px var(--tab-color); }
+.tab.colored.active { background: color-mix(in srgb, var(--tab-color) 22%, #1e1e1e); }
+.tab .rename {
+  flex: 1; min-width: 0; height: 20px; padding: 0 4px;
+  background: #1e1e1e; color: #fff; border: 1px solid #3b8eea; border-radius: 3px;
+  font: inherit; outline: none;
+}
+
+/* ---- tab context menu ---- */
+.tab-menu { min-width: 240px; }
+.menu-item .glyph {
+  width: 16px; flex: none; text-align: center; color: #ccc;
+  font: 14px "Segoe Fluent Icons", "Segoe MDL2 Assets";
+}
+.menu-item.disabled { color: #666; }
+.menu-item.disabled:hover, .menu-item.static:hover { background: transparent; }
+.menu-item.disabled .glyph { color: #555; }
+.swatches { display: flex; gap: 5px; align-items: center; }
+.swatch {
+  width: 16px; height: 16px; border-radius: 50%; box-sizing: border-box;
+  border: 1px solid rgba(255, 255, 255, 0.15);
+}
+.swatch:hover { transform: scale(1.15); }
+.swatch.selected { outline: 2px solid #fff; outline-offset: 1px; }
+.swatch.none {
+  background: linear-gradient(135deg, transparent 45%, #c42b1c 45% 55%, transparent 55%);
+  border-color: #777;
+}
+
+/* ---- find bar ---- */
+#find-bar {
+  position: absolute; top: 8px; right: 20px; z-index: 20;
+  display: flex; align-items: center; gap: 2px; padding: 5px;
+  background: #2b2b2b; border: 1px solid #444; border-radius: 8px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}
+#find-bar[hidden] { display: none; }
+.find-input {
+  width: 220px; height: 26px; padding: 0 8px; margin-right: 4px;
+  background: #1e1e1e; color: #eee; border: 1px solid #555; border-radius: 4px;
+  font: inherit; outline: none;
+}
+.find-input:focus { border-color: #3b8eea; }
+.find-count { min-width: 44px; color: #999; font-size: 12px; text-align: center; }
+.find-btn {
+  width: 28px; height: 26px; padding: 0; border: none; border-radius: 4px;
+  background: transparent; color: #ccc;
+  font: 12px "Segoe Fluent Icons", "Segoe MDL2 Assets", "Segoe UI";
+}
+.find-btn[data-act="case"], .find-btn[data-act="regex"] { font: 12px "Cascadia Mono", Consolas, monospace; }
+.find-btn:hover { background: #3a3a3a; }
+.find-btn.on { background: #264f78; color: #fff; }

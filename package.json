@@ -13,6 +13,7 @@
     "@tauri-apps/plugin-dialog": "^2.8.4",
     "@tauri-apps/plugin-opener": "^2",
     "@xterm/addon-fit": "^0.10.0",
+    "@xterm/addon-search": "^0.15.0",
     "@xterm/addon-serialize": "^0.13.0",
     "@xterm/addon-unicode11": "^0.8.0",
     "@xterm/addon-web-links": "^0.11.0",

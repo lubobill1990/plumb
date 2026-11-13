@@ -381,6 +381,12 @@ fn pty_stash(state: State<'_, PtyState>, id: u32, snapshot: serde_json::Value) -
     Ok(())
 }
 
+/// Save a tab's text ("Export text"). The path comes from the native save dialog.
+#[tauri::command]
+fn write_text_file(path: String, contents: String) -> Result<(), String> {
+    std::fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
 /// Adopt a detached session: replays snapshot + buffered output, then streams live.
 #[tauri::command]
 fn pty_attach(window: Window, state: State<'_, PtyState>, id: u32, on_event: Channel<PtyEvent>) -> Result<(), String> {
@@ -557,7 +563,8 @@ pub fn run() {
             open_window,
             drop_target,
             drag_preview,
-            window_drag
+            window_drag,
+            write_text_file
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
