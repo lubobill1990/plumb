@@ -1,0 +1,718 @@
+import { Terminal, type ITheme } from "@xterm/xterm";
+import { FitAddon } from "@xterm/addon-fit";
+import { Unicode11Addon } from "@xterm/addon-unicode11";
+import { WebglAddon } from "@xterm/addon-webgl";
+import { WebLinksAddon } from "@xterm/addon-web-links";
+import { SerializeAddon } from "@xterm/addon-serialize";
+import { Channel, invoke } from "@tauri-apps/api/core";
+import { emitTo } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { openUrl } from "@tauri-apps/plugin-opener";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import "@xterm/xterm/css/xterm.css";
+import "./style.css";
+
+interface Profile {
+  id: string;
+  name: string;
+  kind: "shell" | "agent";
+  command: string | null;
+  program: string;
+  args: string[];
+}
+interface Platform {
+  windowsBuild: number | null;
+  profiles: Profile[];
+  home: string | null;
+  initialDir: string | null;
+}
+/** What travels with a tab when it moves to another window. */
+interface Snapshot {
+  buffer: string;
+  cols: number;
+  rows: number;
+  cursorHidden: boolean;
+  title: string;
+  profile: Profile;
+  exited: boolean;
+  cwd: string | null;
+}
+type PtyEvent =
+  | { type: "data"; data: string }
+  | { type: "exit"; code: number }
+  | { type: "snapshot"; data: Snapshot };
+
+const theme: ITheme = {
+  background: "#1e1e1e",
+  foreground: "#d4d4d4",
+  cursor: "#d4d4d4",
+  selectionBackground: "#264f78",
+};
+
+// DEC private modes that mark "a TUI app is starting / stopping":
+// 1049/1047/47 = alternate screen, 2004 = bracketed paste (Claude Code toggles it on enter/exit).
+const TUI_MODES = new Set([47, 1047, 1049, 2004]);
+
+const $ = <T extends HTMLElement>(sel: string) => document.querySelector(sel) as T;
+const titlebar = $<HTMLDivElement>("#titlebar");
+const tabsEl = $<HTMLDivElement>("#tabs");
+const termsEl = $<HTMLDivElement>("#terminals");
+const autoRepaintEl = $<HTMLInputElement>("#auto-repaint");
+const appWindow = getCurrentWindow();
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+autoRepaintEl.checked = localStorage.getItem("autoRepaint") !== "0";
+autoRepaintEl.onchange = () => localStorage.setItem("autoRepaint", autoRepaintEl.checked ? "1" : "0");
+
+let platform: Platform;
+const tabs: Tab[] = [];
+let active: Tab | null = null;
+
+class Tab {
+  term: Terminal;
+  fit = new FitAddon();
+  serializer = new SerializeAddon();
+  webgl?: WebglAddon;
+  host: HTMLDivElement;
+  tabBtn: HTMLDivElement;
+  /** Backend session id. Kept after the process exits, until the tab is closed. */
+  id: number | null = null;
+  exited = false;
+  title: string;
+  private repaintTimer?: number;
+
+  constructor(public profile: Profile, public cwd: string | null = null) {
+    this.title = profile.name;
+    this.host = document.createElement("div");
+    this.host.className = "term-host";
+    termsEl.appendChild(this.host);
+
+    this.tabBtn = document.createElement("div");
+    this.tabBtn.className = "tab";
+    this.tabBtn.innerHTML = `<span class="title"></span><span class="dir"></span><span class="close" title="关闭 (Ctrl+Shift+W)">✕</span>`;
+    this.tabBtn.onpointerdown = (e) => {
+      if (e.button !== 0) return;
+      if ((e.target as HTMLElement).classList.contains("close")) return;
+      activate(this);
+      startTabDrag(this, e);
+    };
+    this.tabBtn.onclick = (e) => {
+      if ((e.target as HTMLElement).classList.contains("close")) this.close();
+    };
+    this.tabBtn.onauxclick = (e) => { if (e.button === 1) this.close(); };
+    tabsEl.appendChild(this.tabBtn);
+    this.setTitle(profile.name);
+
+    this.term = new Terminal({
+      fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Sarasa Mono SC", "Microsoft YaHei UI", monospace',
+      fontSize: 14,
+      cursorBlink: true,
+      scrollback: 10000,
+      allowProposedApi: true,
+      theme,
+      // Tells xterm.js it is behind ConPTY: disables xterm's own reflow on resize
+      // (ConPTY re-renders the viewport itself) — the two fighting is a classic source
+      // of garbled lines after resizing.
+      windowsPty: platform.windowsBuild
+        ? { backend: "conpty", buildNumber: platform.windowsBuild }
+        : undefined,
+    });
+
+    // Use Unicode 11 widths so emoji / CJK / Claude's symbols take the same number
+    // of cells as the app thinks they do. Width mismatch == shifted / garbled lines.
+    this.term.loadAddon(new Unicode11Addon());
+    this.term.unicode.activeVersion = "11";
+    this.term.loadAddon(this.fit);
+    this.term.loadAddon(this.serializer);
+    this.term.loadAddon(new WebLinksAddon((_e, uri) => void openUrl(uri)));
+    this.term.open(this.host);
+    try {
+      this.webgl = new WebglAddon();
+      this.webgl.onContextLoss(() => { this.webgl?.dispose(); this.webgl = undefined; });
+      this.term.loadAddon(this.webgl);
+    } catch {
+      this.webgl = undefined; // fall back to DOM renderer
+    }
+
+    this.term.onTitleChange((t) => this.setTitle(t || this.profile.name));
+    this.term.onData((data) => {
+      if (this.exited) return this.close();
+      this.write(data);
+    });
+    this.term.onResize(({ cols, rows }) => {
+      if (this.id !== null && !this.exited) void invoke("pty_resize", { id: this.id, cols, rows }).catch(() => {});
+    });
+    this.term.attachCustomKeyEventHandler((e) => this.onKey(e));
+
+    // The shell reports its cwd: OSC 9;9;"C:\path" (Windows Terminal style, injected
+    // into our pwsh/cmd prompts) or OSC 7;file://host/path (bash, fish, ...)
+    this.term.parser.registerOscHandler(9, (data) => {
+      if (data.startsWith("9;")) this.setCwd(data.slice(2).replace(/^"(.*)"$/, "$1"));
+      return data.startsWith("9;");
+    });
+    this.term.parser.registerOscHandler(7, (data) => {
+      try {
+        const path = decodeURIComponent(new URL(data).pathname);
+        this.setCwd(/^\/[a-z]:/i.test(path) ? path.slice(1).replace(/\//g, "\\") : path);
+      } catch { /* ignore malformed */ }
+      return true;
+    });
+
+    for (const final of ["h", "l"]) {
+      this.term.parser.registerCsiHandler({ prefix: "?", final }, (params) => {
+        if (params.some((p) => TUI_MODES.has(Array.isArray(p) ? p[0] : p))) this.scheduleRepaint();
+        return false; // let xterm handle the sequence normally
+      });
+    }
+  }
+
+  setTitle(t: string) {
+    // "C:\Program Files\PowerShell\7\pwsh.exe" -> "pwsh"
+    const exe = /^[a-z]:\\.*\\([^\\]+)\.exe$/i.exec(t);
+    if (exe) t = exe[1];
+    this.title = t;
+    (this.tabBtn.querySelector(".title") as HTMLElement).textContent = t;
+    this.renderTab();
+    if (this === active) void appWindow.setTitle(t);
+  }
+
+  setCwd(dir: string) {
+    if (!dir || dir === this.cwd) return;
+    this.cwd = dir;
+    this.renderTab();
+  }
+
+  /** Tab shows the folder name next to the title — tells apart several agents. */
+  private renderTab() {
+    const dir = this.cwd ? baseName(this.cwd) : "";
+    (this.tabBtn.querySelector(".dir") as HTMLElement).textContent = dir && !this.title.includes(dir) ? dir : "";
+    this.tabBtn.title = this.cwd ? `${this.title}
+${this.cwd}` : this.title;
+  }
+
+  private channel() {
+    const channel = new Channel<PtyEvent>();
+    channel.onmessage = (ev) => {
+      if (ev.type === "data") this.term.write(ev.data);
+      else if (ev.type === "snapshot") {
+        const s = ev.data;
+        this.profile = s.profile;
+        if (s.cwd) this.setCwd(s.cwd);
+        this.setTitle(s.title);
+        this.exited = s.exited;
+        // replay at the size it was captured at, then fit to this window and let
+        // ConPTY / the app redraw at the new size
+        this.term.resize(s.cols, s.rows);
+        // SerializeAddon doesn't carry DECTCEM; TUIs like Claude Code hide the real cursor
+        this.term.write(s.buffer + (s.cursorHidden ? "\x1b[?25l" : ""), () => {
+          this.fitNow();
+          this.repaint();
+        });
+      } else {
+        this.exited = true;
+        this.term.write(`\r\n\x1b[90m[进程已退出，代码 ${ev.code}，按任意键关闭标签]\x1b[0m`);
+      }
+    };
+    return channel;
+  }
+
+  async spawn() {
+    this.fit.fit();
+    try {
+      this.id = await invoke<number>("pty_spawn", {
+        program: this.profile.program,
+        args: this.profile.args,
+        cwd: this.cwd ?? platform.home,
+        cols: this.term.cols,
+        rows: this.term.rows,
+        onEvent: this.channel(),
+      });
+    } catch (err) {
+      this.exited = true;
+      this.term.write(`\x1b[31m${err}\x1b[0m\r\n`);
+    }
+  }
+
+  /** Adopt a session detached by another window. */
+  async attach(id: number) {
+    this.id = id;
+    this.fit.fit();
+    await invoke("pty_attach", { id, onEvent: this.channel() });
+  }
+
+  /** Prepare this tab's session for handover; caller disposes the tab afterwards. */
+  async detach(): Promise<number | null> {
+    const id = this.id;
+    if (id === null) return null;
+    await invoke("pty_detach", { id }); // backend buffers output from here on
+    await sleep(30); // let in-flight output messages land
+    await new Promise<void>((r) => this.term.write("", r));
+    const snapshot: Snapshot = {
+      buffer: this.serializer.serialize({ scrollback: 3000 }),
+      cols: this.term.cols,
+      rows: this.term.rows,
+      // not in the public API
+      cursorHidden: !!(this.term as unknown as { _core?: { coreService?: { isCursorHidden?: boolean } } })
+        ._core?.coreService?.isCursorHidden,
+      title: this.title,
+      profile: this.profile,
+      exited: this.exited,
+      cwd: this.cwd,
+    };
+    await invoke("pty_stash", { id, snapshot });
+    this.id = null;
+    return id;
+  }
+
+  write(data: string) {
+    if (this.id !== null) void invoke("pty_write", { id: this.id, data }).catch(() => {});
+  }
+
+  onKey(e: KeyboardEvent): boolean {
+    const ctrl = e.ctrlKey && !e.altKey && !e.metaKey;
+    const key = e.key.toLowerCase();
+    const down = e.type === "keydown";
+
+    // Ctrl+Shift+C, or Ctrl+C with a selection: copy
+    if (ctrl && key === "c" && (e.shiftKey || this.term.hasSelection())) {
+      if (down) {
+        void navigator.clipboard.writeText(this.term.getSelection());
+        this.term.clearSelection();
+      }
+      e.preventDefault();
+      return false;
+    }
+    // Ctrl+V / Ctrl+Shift+V: let the browser fire a native paste event (xterm handles it,
+    // incl. bracketed paste)
+    if (ctrl && key === "v") return false;
+    // Shift+Enter: newline inside Claude Code's prompt (sent as Meta+Enter)
+    if (e.shiftKey && !e.ctrlKey && !e.altKey && e.key === "Enter") {
+      if (down) this.write("\x1b\r");
+      e.preventDefault();
+      return false;
+    }
+    if (ctrl && e.shiftKey) {
+      const actions: Record<string, () => void> = {
+        r: () => this.repaint(),
+        t: () => void newTab(),
+        w: () => this.close(),
+      };
+      if (actions[key]) {
+        if (down) actions[key]();
+        e.preventDefault();
+        return false;
+      }
+    }
+    return true;
+  }
+
+  scheduleRepaint() {
+    if (!autoRepaintEl.checked) return;
+    clearTimeout(this.repaintTimer);
+    // Wait until the app has finished its enter/exit output burst.
+    this.repaintTimer = window.setTimeout(() => this.repaint(), 250);
+  }
+
+  /**
+   * What maximize/minimize does by accident, done on purpose: briefly change the PTY
+   * width and restore it. ConPTY re-renders its viewport and the app (Claude Code /
+   * Ink, vim, ...) gets a resize event and redraws from scratch.
+   */
+  repaint() {
+    if (this.id === null || this.exited) return;
+    const id = this.id;
+    this.fitNow();
+    const { cols, rows } = this.term;
+    this.webgl?.clearTextureAtlas();
+    void invoke("pty_resize", { id, cols: Math.max(cols - 1, 2), rows })
+      .then(() => sleep(40))
+      .then(() => invoke("pty_resize", { id, cols: this.term.cols, rows: this.term.rows }))
+      .then(() => this.term.refresh(0, this.term.rows - 1))
+      .catch(() => {});
+  }
+
+  fitNow() {
+    if (this.host.offsetWidth > 0 && this.host.offsetHeight > 0) this.fit.fit();
+  }
+
+  /** Remove the tab from this window (does not touch the backend session). */
+  dispose() {
+    clearTimeout(this.repaintTimer);
+    this.term.dispose();
+    this.host.remove();
+    this.tabBtn.remove();
+    const i = tabs.indexOf(this);
+    if (i < 0) return;
+    tabs.splice(i, 1);
+    // xterm's WebGL renderers share one glyph atlas; disposing a terminal corrupts
+    // it for the others, so rebuild it.
+    for (const t of tabs) {
+      t.webgl?.clearTextureAtlas();
+      t.term.refresh(0, t.term.rows - 1);
+    }
+    if (active === this) {
+      active = null;
+      const next = tabs[i] ?? tabs[i - 1];
+      if (next) activate(next);
+    }
+    if (tabs.length === 0) void appWindow.close();
+  }
+
+  close() {
+    if (this.id !== null) void invoke("pty_kill", { id: this.id });
+    this.id = null;
+    this.dispose();
+  }
+}
+
+function activate(tab: Tab) {
+  if (active === tab) return;
+  for (const t of tabs) {
+    const on = t === tab;
+    t.host.classList.toggle("active", on);
+    t.tabBtn.classList.toggle("active", on);
+  }
+  active = tab;
+  void appWindow.setTitle(tab.title);
+  requestAnimationFrame(() => {
+    tab.fitNow();
+    tab.term.focus();
+  });
+}
+
+function addTab(tab: Tab) {
+  tabs.push(tab);
+  activate(tab);
+  return new Promise((r) => requestAnimationFrame(r));
+}
+
+/** Open a tab; defaults: last used profile, in the active tab's directory. */
+async function newTab(profile?: Profile, cwd?: string | null) {
+  profile ??= defaultProfile();
+  cwd ??= active?.cwd ?? platform.initialDir ?? platform.home;
+  if (cwd) rememberDir(cwd);
+  const tab = new Tab(profile, cwd);
+  await addTab(tab);
+  await tab.spawn();
+}
+
+async function adoptTab(id: number) {
+  const tab = new Tab({ id: "", name: "…", kind: "shell", command: null, program: "", args: [] });
+  await addTab(tab);
+  await tab.attach(id);
+  void appWindow.setFocus();
+}
+
+// ---------------------------------------------------------------------------
+// Tab dragging: reorder inside the strip, tear out into a new window, or drop
+// onto another window's tab strip to merge. With a single tab, dragging the tab
+// drags the whole window (like Windows Terminal).
+// ---------------------------------------------------------------------------
+function startTabDrag(tab: Tab, down: PointerEvent) {
+  const btn = tab.tabBtn;
+  btn.setPointerCapture(down.pointerId);
+  const single = tabs.length === 1;
+  const grabX = down.clientX - btn.getBoundingClientRect().left;
+  let mode: "none" | "reorder" | "tear" | "window" = "none";
+  let target: string | null = null;
+  let polling = false;
+
+  const previewInfo = () => ({
+    title: tab.title,
+    hint: target ? "松开以合并到该窗口" : "松开以在新窗口中打开",
+  });
+
+  /** Ask the backend which other window's tab strip is under the cursor. */
+  const pollTarget = async () => {
+    if (polling) return;
+    polling = true;
+    const t = await invoke<string | null>("drop_target").catch(() => null);
+    polling = false;
+    if (t === target) return;
+    if (target) void emitTo(target, "drop-hint", null);
+    if (t) void emitTo(t, "drop-hint", tab.title);
+    target = t;
+    if (mode === "tear") void invoke("drag_preview", { phase: "show", info: previewInfo() });
+  };
+
+  const move = (e: PointerEvent) => {
+    if (mode === "none" && Math.hypot(e.clientX - down.clientX, e.clientY - down.clientY) < 6) return;
+
+    // only tab: drag the whole window (it is its own preview)
+    if (single) {
+      if (mode === "none") {
+        mode = "window";
+        void invoke("window_drag", { phase: "start" });
+      }
+      void invoke("window_drag", { phase: "move" });
+      void pollTarget();
+      return;
+    }
+
+    const bar = titlebar.getBoundingClientRect();
+    const outside = e.clientY < bar.top - 25 || e.clientY > bar.bottom + 25 || e.clientX < 0 || e.clientX > innerWidth;
+    if (outside) {
+      if (mode !== "tear") {
+        mode = "tear";
+        btn.style.transform = "";
+        btn.classList.remove("lifting");
+        btn.classList.add("ghost");
+        document.body.classList.add("tab-tearing");
+        void invoke("drag_preview", { phase: "show", info: previewInfo() });
+      } else {
+        void invoke("drag_preview", { phase: "move" });
+      }
+      void pollTarget();
+    } else {
+      if (mode === "tear") {
+        // came back into the strip: cancel the tear-out
+        void invoke("drag_preview", { phase: "hide" });
+        btn.classList.remove("ghost");
+        document.body.classList.remove("tab-tearing");
+        if (target) void emitTo(target, "drop-hint", null);
+        target = null;
+      }
+      mode = "reorder";
+      btn.classList.add("lifting");
+      reorder(tab, e.clientX);
+      // keep the tab glued to the pointer, within the strip
+      const strip = tabsEl.getBoundingClientRect();
+      const natural = strip.left + btn.offsetLeft;
+      const left = Math.min(Math.max(e.clientX - grabX, strip.left), strip.right - btn.offsetWidth);
+      btn.style.transform = `translateX(${left - natural}px)`;
+    }
+  };
+
+  const up = async () => {
+    btn.removeEventListener("pointermove", move);
+    btn.removeEventListener("pointerup", up);
+    btn.removeEventListener("pointercancel", up);
+    btn.style.transform = "";
+    btn.classList.remove("lifting", "ghost");
+    document.body.classList.remove("tab-tearing");
+    if (mode === "window") void invoke("window_drag", { phase: "end" });
+    if (mode !== "window" && mode !== "tear") return;
+
+    const dest = await invoke<string | null>("drop_target").catch(() => null);
+    if (target) void emitTo(target, "drop-hint", null);
+    if (dest) {
+      const id = await tab.detach();
+      if (id !== null) await emitTo(dest, "attach-tab", id);
+      void invoke("drag_preview", { phase: "hide" });
+      tab.dispose(); // closes this window if it was the last tab
+    } else if (mode === "tear") {
+      const { innerWidth: width, innerHeight: height } = window;
+      const id = await tab.detach();
+      if (id !== null) await invoke("open_window", { attach: id, width, height });
+      void invoke("drag_preview", { phase: "hide" });
+      tab.dispose();
+    }
+  };
+
+  btn.addEventListener("pointermove", move);
+  btn.addEventListener("pointerup", up);
+  btn.addEventListener("pointercancel", up);
+}
+
+function reorder(tab: Tab, x: number) {
+  const others = tabs.filter((t) => t !== tab);
+  let idx = others.findIndex((t) => {
+    const r = t.tabBtn.getBoundingClientRect();
+    return x < r.left + r.width / 2;
+  });
+  if (idx < 0) idx = others.length;
+  others.splice(idx, 0, tab);
+  if (others.every((t, i) => t === tabs[i])) return;
+  tabs.splice(0, tabs.length, ...others);
+  tabsEl.append(...tabs.map((t) => t.tabBtn));
+}
+
+/** Another window is dragging a tab over our strip: show where it would land. */
+let placeholder: HTMLDivElement | null = null;
+function showDropHint(title: string | null) {
+  titlebar.classList.toggle("drop-target", title !== null);
+  if (title === null) {
+    placeholder?.remove();
+    placeholder = null;
+    return;
+  }
+  placeholder ??= Object.assign(document.createElement("div"), { className: "tab placeholder" });
+  placeholder.textContent = `＋ ${title}`;
+  tabsEl.appendChild(placeholder);
+}
+
+// ---------------------------------------------------------------------------
+// window chrome
+// ---------------------------------------------------------------------------
+const maxBtn = $<HTMLButtonElement>("#win-max");
+$<HTMLButtonElement>("#win-min").onclick = () => void appWindow.minimize();
+maxBtn.onclick = () => void appWindow.toggleMaximize();
+$<HTMLButtonElement>("#win-close").onclick = () => void appWindow.close();
+const syncMaxIcon = async () => {
+  const max = await appWindow.isMaximized();
+  maxBtn.innerHTML = max ? "&#xE923;" : "&#xE922;";
+  maxBtn.title = max ? "还原" : "最大化";
+};
+void appWindow.onResized(() => void syncMaxIcon());
+void syncMaxIcon();
+
+const thisWebview = getCurrentWebviewWindow();
+void thisWebview.listen<number>("attach-tab", (e) => void adoptTab(e.payload));
+void thisWebview.listen<string | null>("drop-hint", (e) => showDropHint(e.payload));
+
+// Keep xterm's grid and the PTY size in lockstep with the window.
+let fitRaf = 0;
+new ResizeObserver(() => {
+  cancelAnimationFrame(fitRaf);
+  fitRaf = requestAnimationFrame(() => active?.fitNow());
+}).observe(termsEl);
+
+$<HTMLButtonElement>("#new-tab").onclick = () => void newTab();
+$<HTMLButtonElement>("#repaint").onclick = () => {
+  active?.repaint();
+  active?.term.focus();
+};
+window.addEventListener("keydown", (e) => {
+  // shortcuts when the terminal itself doesn't have focus
+  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") { e.preventDefault(); void newTab(); }
+});
+
+// ---------------------------------------------------------------------------
+// launcher: pick a profile (shell / agent CLI) and the directory to start in
+// ---------------------------------------------------------------------------
+const launcher = $<HTMLDivElement>("#launcher");
+const launchBtn = $<HTMLButtonElement>("#launch-menu");
+let launchDir: string | null = null;
+
+function defaultProfile(): Profile {
+  const id = localStorage.getItem("profileId");
+  return platform.profiles.find((p) => p.id === id) ?? platform.profiles[0];
+}
+
+function baseName(path: string) {
+  return path.replace(/[\\/]+$/, "").split(/[\\/]/).pop() || path;
+}
+
+function prettyDir(dir: string) {
+  const home = platform.home;
+  return home && dir.toLowerCase().startsWith(home.toLowerCase()) ? "~" + dir.slice(home.length) : dir;
+}
+
+function recentDirs(): string[] {
+  try {
+    return JSON.parse(localStorage.getItem("recentDirs") ?? "[]");
+  } catch {
+    return [];
+  }
+}
+
+function rememberDir(dir: string) {
+  const list = [dir, ...recentDirs().filter((d) => d.toLowerCase() !== dir.toLowerCase())].slice(0, 12);
+  localStorage.setItem("recentDirs", JSON.stringify(list));
+}
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, cls = "", text = "") {
+  const e = document.createElement(tag);
+  e.className = cls;
+  e.textContent = text;
+  return e;
+}
+
+async function openLauncher() {
+  // rescan PATH so freshly installed agent CLIs show up without a restart
+  platform.profiles = (await invoke<Platform>("platform_info")).profiles;
+  launchDir = active?.cwd ?? platform.initialDir ?? platform.home;
+  renderLauncher();
+  launcher.hidden = false;
+  const r = launchBtn.getBoundingClientRect();
+  launcher.style.top = `${r.bottom + 2}px`;
+  launcher.style.left = `${Math.max(4, Math.min(r.left, innerWidth - launcher.offsetWidth - 4))}px`;
+}
+
+function closeLauncher() {
+  launcher.hidden = true;
+  active?.term.focus();
+}
+
+function renderLauncher() {
+  launcher.replaceChildren();
+  const seen = new Set<string>();
+  const dirs = [launchDir, ...tabs.map((t) => t.cwd), ...recentDirs()].filter((d): d is string => {
+    if (!d || seen.has(d.toLowerCase())) return false;
+    seen.add(d.toLowerCase());
+    return true;
+  }).slice(0, 8);
+
+  launcher.append(el("div", "menu-label", "启动目录"));
+  for (const d of dirs) {
+    const row = el("div", "menu-item dir-item" + (d === launchDir ? " selected" : ""));
+    row.append(el("span", "radio"), el("span", "grow", prettyDir(d)));
+    if (d === active?.cwd) row.append(el("span", "badge", "当前标签"));
+    row.title = d;
+    row.onclick = () => { launchDir = d; renderLauncher(); };
+    launcher.append(row);
+  }
+  const browse = el("div", "menu-item", "");
+  browse.append(el("span", "icon", "📁"), el("span", "grow", "选择文件夹…"));
+  browse.onclick = async () => {
+    const picked = await openDialog({ directory: true, defaultPath: launchDir ?? undefined, title: "选择启动目录" });
+    if (typeof picked === "string") {
+      launchDir = picked;
+      rememberDir(picked);
+    }
+    renderLauncher();
+  };
+  launcher.append(browse, el("div", "menu-sep"));
+
+  const def = defaultProfile();
+  const section = (label: string, list: Profile[]) => {
+    launcher.append(el("div", "menu-label", label));
+    for (const p of list) {
+      const row = el("div", "menu-item");
+      row.append(el("span", "icon", p.kind === "agent" ? "✳" : "›"), el("span", "grow", p.name));
+      if (p.command) row.append(el("span", "hint", p.command));
+      if (p.id === def.id) row.append(el("span", "badge", "默认"));
+      row.title = `在 ${launchDir ?? "~"} 中启动 ${p.name}`;
+      row.onclick = () => {
+        localStorage.setItem("profileId", p.id);
+        launcher.hidden = true;
+        void newTab(p, launchDir);
+      };
+      launcher.append(row);
+    }
+  };
+  section("Shell", platform.profiles.filter((p) => p.kind === "shell"));
+  const agents = platform.profiles.filter((p) => p.kind === "agent");
+  if (agents.length) section("Agent", agents);
+  else {
+    launcher.append(el("div", "menu-label", "Agent"));
+    launcher.append(el("div", "menu-note", "PATH 中未检测到 agent CLI（支持 claude、copilot、codex、gemini、qwen、opencode、cursor-agent、amp、aider …）"));
+  }
+}
+
+launchBtn.onclick = () => (launcher.hidden ? void openLauncher() : closeLauncher());
+document.addEventListener("pointerdown", (e) => {
+  const t = e.target as Node;
+  if (!launcher.hidden && !launcher.contains(t) && !launchBtn.contains(t)) launcher.hidden = true;
+});
+document.addEventListener("keydown", (e) => {
+  if (e.key === "Escape" && !launcher.hidden) closeLauncher();
+});
+$<HTMLButtonElement>("#new-tab").onmouseenter = (e) => {
+  const dir = active?.cwd ?? platform.home;
+  (e.target as HTMLElement).title = `新建 ${defaultProfile().name}${dir ? `（${prettyDir(dir)}）` : ""}  Ctrl+Shift+T`;
+};
+
+async function init() {
+  platform = await invoke<Platform>("platform_info");
+  await document.fonts.ready; // measure cell size with the real font, not a fallback
+
+  const attachId = (window as { __ATTACH__?: number | null }).__ATTACH__;
+  if (attachId != null) await adoptTab(attachId);
+  else await newTab();
+}
+
+void init();
+
+if (import.meta.env.DEV) Object.assign(window, { __tabs: tabs, __drag: { startTabDrag, adoptTab } });

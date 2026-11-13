@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>Terminal</title>
+  </head>
+  <body>
+    <div id="titlebar" data-tauri-drag-region>
+      <div id="tabs" data-tauri-drag-region></div>
+      <button id="new-tab" class="flat" title="新标签 (Ctrl+Shift+T)">＋</button>
+      <button id="launch-menu" class="flat" title="选择配置和启动目录">&#xE70D;</button>
+      <div class="spacer" data-tauri-drag-region></div>
+      <label class="flat" title="检测到进入/退出 TUI 程序（alt-screen、bracketed-paste 切换）时自动重绘">
+        <input type="checkbox" id="auto-repaint" /> 自动重绘
+      </label>
+      <button id="repaint" class="flat" title="强制重绘 (Ctrl+Shift+R)">⟳</button>
+      <div id="win-controls">
+        <button id="win-min" title="最小化">&#xE921;</button>
+        <button id="win-max" title="最大化">&#xE922;</button>
+        <button id="win-close" title="关闭">&#xE8BB;</button>
+      </div>
+    </div>
+    <div id="terminals"></div>
+    <div id="launcher" class="menu" hidden></div>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

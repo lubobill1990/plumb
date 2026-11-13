@@ -1,0 +1,50 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>drag preview</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: transparent; overflow: hidden; user-select: none; }
+      body { padding: 6px; box-sizing: border-box; font: 12px "Segoe UI", "Microsoft YaHei UI", sans-serif; }
+      .win {
+        height: 100%;
+        border-radius: 8px;
+        overflow: hidden;
+        background: #1e1e1e;
+        border: 1px solid #3b8eea;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.55);
+        display: flex;
+        flex-direction: column;
+        opacity: 0.94;
+      }
+      .bar { height: 26px; background: #2b2b2b; display: flex; align-items: flex-end; padding-left: 4px; }
+      .tab {
+        height: 22px; max-width: 200px; padding: 0 10px;
+        display: flex; align-items: center;
+        background: #1e1e1e; color: #fff; border-radius: 5px 5px 0 0;
+        white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+      }
+      .body { flex: 1; padding: 8px 10px; }
+      .line { height: 6px; border-radius: 3px; background: #3a3a3a; margin: 7px 0; }
+      .hint { color: #8ab4f8; margin-top: 10px; }
+    </style>
+  </head>
+  <body>
+    <div class="win">
+      <div class="bar"><div class="tab" id="title">Terminal</div></div>
+      <div class="body">
+        <div class="line" style="width: 70%"></div>
+        <div class="line" style="width: 45%"></div>
+        <div class="line" style="width: 82%"></div>
+        <div class="hint" id="hint">松开以在新窗口中打开</div>
+      </div>
+    </div>
+    <script type="module">
+      import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+      getCurrentWebviewWindow().listen("preview", (e) => {
+        document.getElementById("title").textContent = e.payload.title;
+        document.getElementById("hint").textContent = e.payload.hint;
+      });
+    </script>
+  </body>
+</html>
