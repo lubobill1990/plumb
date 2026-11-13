@@ -87,8 +87,10 @@ body.tab-tearing, body.tab-tearing * { cursor: grabbing !important; }
 }
 .flat:hover { background: #3a3a3a; }
 /* buttons next to the tabs: same top edge as the tabs (4px), bottom-aligned with the strip */
-#new-tab, #launch-menu { align-self: flex-end; height: 28px; margin-bottom: 4px; }
-#new-tab { font-size: 15px; padding: 0 9px; }
+#new-tab, #launch-menu { align-self: flex-end; height: 28px; margin-bottom: 4px; box-sizing: border-box; padding-top: 3px !important; }
+/* both glyphs from Segoe Fluent Icons, centered in the same box: same optical center */
+#new-tab, #launch-menu { display: flex; align-items: center; justify-content: center; line-height: 1; font-family: "Segoe Fluent Icons", "Segoe MDL2 Assets"; }
+#new-tab { font-size: 12px; width: 32px; padding: 0; }
 select.flat { padding: 0 4px; }
 select.flat option { background: #2b2b2b; }
 .flat.icon { display: flex; align-items: center; justify-content: center; width: 30px; padding: 0; }
@@ -136,7 +138,7 @@ select.flat option { background: #2b2b2b; }
   pointer-events: none;
 }
 .tab .dir:empty { display: none; }
-#launch-menu { padding: 0 6px; font: 10px "Segoe Fluent Icons", "Segoe MDL2 Assets"; margin-left: -4px; }
+#launch-menu { padding: 0; width: 24px; font-size: 10px; margin-left: -4px; }
 
 /* ---- launcher menu ---- */
 .menu {
