@@ -675,7 +675,10 @@ $<HTMLButtonElement>("#repaint").onclick = () => {
   active?.term.focus();
 };
 window.addEventListener("keydown", (e) => {
-  // shortcuts when the terminal itself doesn't have focus
+  // shortcuts when the terminal itself doesn't have focus. When it does, Tab.onKey has
+  // already run (and called preventDefault) before the event bubbles up here — skip it,
+  // or Ctrl+Shift+T opens two tabs.
+  if (e.defaultPrevented) return;
   if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") { e.preventDefault(); void newTab(); }
 });
 
