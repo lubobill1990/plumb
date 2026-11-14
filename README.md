@@ -69,3 +69,38 @@ npm run tauri build    # installer in src-tauri/target/release/bundle/nsis
 ## License
 
 [MIT](LICENSE)
+
+## Updates
+
+Plumb updates itself from this repo's GitHub Releases, with a dedicated updater modelled on
+[Longarm](https://github.com/lubobill1990/longarm)'s update service:
+
+- **Check**: at start and every 6 hours, `latest.json` of the newest release. Only a
+  strictly newer version is offered; never a downgrade.
+- **Verify**: the installer is downloaded in the background and must carry a minisign
+  signature from the release key built into the app, whose trusted comment names exactly
+  `Plumb_<version>_x64-setup.exe` (an older release's signature can't be replayed).
+- **Install when you say so**: the title bar shows "Plumb x.y.z 已就绪 · 重启更新". A
+  restart ends every tab's process, so Plumb never restarts on its own and asks first
+  when tabs are open.
+- **Dedicated updater**: `plumb.exe --updater`, run from a copy in
+  `%LOCALAPPDATA%\com.lubobill1990.plumb\updates`, waits for Plumb to exit, verifies the
+  installer again, backs up the install, installs silently, checks the installed version,
+  starts it and waits up to 60 s for it to report healthy.
+- **Rollback**: if any step after the backup fails (installer error, wrong version, the
+  new version crashes or never reports healthy) the backup is restored and the previous
+  version started. The launcher (⌄ menu) also offers "回滚到 <previous version>".
+- **Monitoring**: every phase is written to `updates\state.json` and `updates\update.log`;
+  the next start of Plumb shows the outcome (updated / rolled back / failed) and the
+  launcher opens the log.
+
+## Releasing
+
+1. Bump `version` in `src-tauri/tauri.conf.json`, `src-tauri/Cargo.toml` and `package.json`.
+2. Merge to `main`, then push a tag: `git tag v0.2.0 && git push origin v0.2.0`.
+3. The Release workflow builds and signs the installer and publishes it with `latest.json`;
+   installed copies offer the update within 6 hours.
+
+Signing needs the repo secrets `TAURI_SIGNING_PRIVATE_KEY` and
+`TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the updater key; its public half is
+`src-tauri/updater.pub`). The updater E2E test is in `scripts/updater-e2e`.

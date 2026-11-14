@@ -5,7 +5,8 @@
 //! * the app (Tauri commands in lib.rs) checks GitHub Releases, downloads a newer
 //!   installer and verifies it, then hands over to
 //! * the updater program: `plumb.exe --updater apply ...`, run from a copy in
-//!   `%LOCALAPPDATA%\Plumb\updates` so the installer can replace the install dir. It waits
+//!   `%LOCALAPPDATA%\com.lubobill1990.plumb\updates` (outside the install dir, so the
+//!   installer can replace it and the backup doesn't copy itself). It waits
 //!   for Plumb to exit, backs up the install, runs the installer, checks the new version
 //!   and that it starts healthy, and rolls back to the backup when any step fails.
 //!
@@ -55,9 +56,12 @@ pub fn installer_name(version: &str) -> String {
 // paths, log, state
 // ---------------------------------------------------------------------------
 
+/// Outside the install dir (%LOCALAPPDATA%\Plumb): the backup copies the install dir, and
+/// the installer may clean it while the updater runs. This is the app's data dir (named
+/// after the bundle identifier), next to the WebView2 profile.
 pub fn updates_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("Plumb").join("updates")
+    base.join("com.lubobill1990.plumb").join("updates")
 }
 
 fn downloads_dir() -> PathBuf {
@@ -128,10 +132,15 @@ fn phase(s: &mut UpdateState, phase: &str, message: &str) {
     log(&format!("{} -> {}: {phase}: {message}", s.from, s.to));
 }
 
-/// The version backed up by the last update, if any (what "roll back" would restore).
-pub fn rollback_version() -> Option<String> {
+fn backup_version() -> Option<String> {
     let v = fs::read_to_string(rollback_dir().join("VERSION")).ok()?.trim().to_string();
-    (!v.is_empty() && v != current_version()).then_some(v)
+    (!v.is_empty()).then_some(v)
+}
+
+/// The version backed up by the last update, if it differs from the running one (what
+/// "roll back" in the app would restore).
+pub fn rollback_version() -> Option<String> {
+    backup_version().filter(|v| v != current_version())
 }
 
 /// Called by the app once it is up (window open, first tab spawned).
@@ -398,11 +407,27 @@ fn launch(dir: &Path) -> Option<u32> {
     cmd.spawn().ok().map(|c| c.id())
 }
 
-fn backup(dir: &Path, version: &str) -> Result<(), String> {
+/// Back up the install dir; returns the version actually backed up (asked from the exe,
+/// not taken from the caller, so a rollback restores and registers the truth).
+fn backup(dir: &Path, claimed: &str) -> Result<String, String> {
+    let version = installed_version(dir).filter(|v| !v.is_empty()).unwrap_or_else(|| claimed.to_string());
     let rb = rollback_dir();
     let _ = fs::remove_dir_all(&rb);
     copy_tree(dir, &rb).map_err(|e| format!("备份失败：{e}"))?;
-    fs::write(rb.join("VERSION"), version).map_err(|e| e.to_string())
+    fs::write(rb.join("VERSION"), &version).map_err(|e| e.to_string())?;
+    Ok(version)
+}
+
+/// Checks that need nothing changed yet: signature, version binding, strictly newer.
+fn precheck(s: &UpdateState) -> Result<(), String> {
+    let installer = downloads_dir().join(installer_name(&s.to));
+    let signature = fs::read_to_string(installer.with_extension("exe.sig")).map_err(|_| "缺少签名文件".to_string())?;
+    let bytes = fs::read(&installer).map_err(|e| format!("读取安装包失败：{e}"))?;
+    verify(&bytes, &signature, &s.to)?; // again: the file sat on disk since the download
+    if !is_newer(&s.to, &s.from) {
+        return Err(format!("{} 不比 {} 新，拒绝安装", s.to, s.from));
+    }
+    Ok(())
 }
 
 fn restore(dir: &Path) -> Result<String, String> {
@@ -427,13 +452,6 @@ fn restore(dir: &Path) -> Result<String, String> {
 /// Run the installer, check the result, health-check the new version. Err = roll back.
 fn install_and_check(s: &mut UpdateState, dir: &Path) -> Result<(), String> {
     let installer = downloads_dir().join(installer_name(&s.to));
-    let signature = fs::read_to_string(installer.with_extension("exe.sig")).map_err(|_| "缺少签名文件".to_string())?;
-    let bytes = fs::read(&installer).map_err(|e| format!("读取安装包失败：{e}"))?;
-    verify(&bytes, &signature, &s.to)?; // again: the file sat on disk since the download
-    if !is_newer(&s.to, &s.from) {
-        return Err(format!("{} 不比 {} 新，拒绝安装", s.to, s.from));
-    }
-
     phase(s, "installing", &format!("运行 {}", installer_name(&s.to)));
     let mut cmd = Command::new(&installer);
     cmd.arg("/S");
@@ -495,13 +513,25 @@ fn run_apply(args: &[String]) -> i32 {
         return 1;
     }
 
-    phase(&mut s, "backup", &format!("备份 {from}"));
-    if let Err(e) = backup(&dir, &from) {
+    // nothing changed yet: a bad package just means "not installed"
+    if let Err(why) = precheck(&s) {
         s.result = Some("failed".into());
-        phase(&mut s, "done", &format!("{e}；未安装任何东西"));
+        phase(&mut s, "done", &format!("未安装 {to}：{why}"));
         launch(&dir);
         return 1;
     }
+
+    phase(&mut s, "backup", &format!("备份 {from}"));
+    let from = match backup(&dir, &from) {
+        Ok(v) => v,
+        Err(e) => {
+            s.result = Some("failed".into());
+            phase(&mut s, "done", &format!("{e}；未安装任何东西"));
+            launch(&dir);
+            return 1;
+        }
+    };
+    s.from = from.clone();
 
     match install_and_check(&mut s, &dir) {
         Ok(()) => {
@@ -536,7 +566,7 @@ fn run_rollback(args: &[String]) -> i32 {
         log("rollback: missing arguments");
         return 2;
     };
-    let to = rollback_version().unwrap_or_default();
+    let to = backup_version().unwrap_or_default();
     let mut s = UpdateState { from, to: to.clone(), started: now(), ..Default::default() };
     phase(&mut s, "waiting", "等待 Plumb 退出（手动回滚）");
     if !wait_exit(pid, EXIT_TIMEOUT) {
