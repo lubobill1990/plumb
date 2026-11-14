@@ -40,7 +40,8 @@ jobs:
         run: cargo test --locked
 
       - name: Bundle installer
-        run: npx tauri build --ci
+        # PRs have no signing key: skip the updater artifacts (.sig / latest.json) here
+        run: npx tauri build --ci --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
       - name: Upload installer
         uses: actions/upload-artifact@v4

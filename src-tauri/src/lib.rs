@@ -1,3 +1,5 @@
+pub mod update;
+
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -362,6 +364,12 @@ fn pty_kill(state: State<'_, PtyState>, id: u32) {
     }
 }
 
+/// Open sessions across all windows (the updater asks before a restart ends them).
+#[tauri::command]
+fn session_count(state: State<'_, PtyState>) -> usize {
+    state.sessions.lock().unwrap().len()
+}
+
 /// Stop delivering output to the current window; output is buffered from now on.
 #[tauri::command]
 fn pty_detach(state: State<'_, PtyState>, id: u32) -> Result<(), String> {
@@ -385,6 +393,108 @@ fn pty_stash(state: State<'_, PtyState>, id: u32, snapshot: serde_json::Value) -
 #[tauri::command]
 fn write_text_file(path: String, contents: String) -> Result<(), String> {
     std::fs::write(&path, contents).map_err(|e| e.to_string())
+}
+
+
+// ---------------------------------------------------------------------------
+// self-update (see update.rs): check / download in the app, install in the updater
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateInfo {
+    current: String,
+    available: Option<update::Available>,
+    rollback: Option<String>,
+}
+
+#[tauri::command]
+async fn update_check() -> Result<UpdateInfo, String> {
+    let av = tauri::async_runtime::spawn_blocking(update::fetch_manifest)
+        .await
+        .map_err(|e| e.to_string())??;
+    let current = update::current_version().to_string();
+    Ok(UpdateInfo {
+        available: update::is_newer(&av.version, &current).then_some(av),
+        rollback: update::rollback_version(),
+        current,
+    })
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DownloadProgress {
+    downloaded: u64,
+    total: Option<u64>,
+}
+
+/// Download + verify the newest release (re-fetches the manifest: the JS side never
+/// supplies a URL or signature).
+#[tauri::command]
+async fn update_download(on_progress: Channel<DownloadProgress>) -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let av = update::fetch_manifest()?;
+        if !update::is_newer(&av.version, update::current_version()) {
+            return Err("已是最新版本".to_string());
+        }
+        let mut last = 0u64;
+        update::download(&av, |downloaded, total| {
+            if downloaded - last >= 256 * 1024 || Some(downloaded) == total {
+                last = downloaded;
+                let _ = on_progress.send(DownloadProgress { downloaded, total });
+            }
+        })?;
+        Ok(av.version)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Hand over to the updater program and quit (all windows).
+#[tauri::command]
+fn update_apply(app: AppHandle, version: String) -> Result<(), String> {
+    update::start_apply(&version)?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_rollback(app: AppHandle) -> Result<(), String> {
+    update::start_rollback()?;
+    app.exit(0);
+    Ok(())
+}
+
+#[tauri::command]
+fn update_state() -> Option<update::UpdateState> {
+    update::read_state()
+}
+
+#[tauri::command]
+fn update_rollback_version() -> Option<String> {
+    update::rollback_version()
+}
+
+#[tauri::command]
+fn update_ack() {
+    if let Some(mut s) = update::read_state() {
+        s.acknowledged = true;
+        update::write_state(&s);
+    }
+}
+
+#[tauri::command]
+fn update_mark_healthy() {
+    update::mark_healthy();
+}
+
+#[tauri::command]
+fn update_open_log() -> Result<(), String> {
+    let path = update::log_path();
+    if !path.exists() {
+        return Err("还没有更新日志".into());
+    }
+    std::process::Command::new("notepad.exe").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Adopt a detached session: replays snapshot + buffered output, then streams live.
@@ -564,7 +674,17 @@ pub fn run() {
             drop_target,
             drag_preview,
             window_drag,
-            write_text_file
+            write_text_file,
+            session_count,
+            update_check,
+            update_download,
+            update_apply,
+            update_rollback,
+            update_state,
+            update_ack,
+            update_mark_healthy,
+            update_open_log,
+            update_rollback_version
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
