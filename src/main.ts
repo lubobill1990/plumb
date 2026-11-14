@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { SearchAddon } from "@xterm/addon-search";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -149,13 +150,23 @@ class Tab {
       findCount.textContent = resultCount ? `${resultIndex + 1}/${resultCount}` : "无结果";
     });
 
-    // Right click: copy the selection, or paste when nothing is selected (Windows Terminal).
+    // OSC 52: apps (Claude Code, vim, tmux ...) copy to the system clipboard through the
+    // terminal. Writes only — like Windows Terminal, apps may not read the clipboard.
+    this.term.loadAddon(new ClipboardAddon({
+      readText: () => "",
+      writeText: (_sel, text) => navigator.clipboard.writeText(text).catch(() => {}),
+    }));
+
+    // Right click (Windows Terminal rules): copy our selection, else paste — unless the app
+    // has turned on mouse reporting (Claude Code does). Then the click is the app's: xterm
+    // already forwarded it, and the app selects / copies on its own. Pasting as well put the
+    // old clipboard into the prompt. Shift+right-click always does copy/paste.
     this.host.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       if (this.term.hasSelection()) {
         void navigator.clipboard.writeText(this.term.getSelection());
         this.term.clearSelection();
-      } else {
+      } else if (this.term.modes.mouseTrackingMode === "none" || e.shiftKey) {
         void navigator.clipboard.readText().then((t) => t && this.term.paste(t)).catch(() => {});
       }
       this.term.focus();
