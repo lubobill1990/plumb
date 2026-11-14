@@ -15,7 +15,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 import { AGENT_ICONS } from "./icons";
-import { initUpdater, checkForUpdate, installUpdate, onUpdateStatus, currentVersion, rollback, rollbackVersion, openUpdateLog, type UpdateStatus } from "./updater";
+import { initUpdater, checkForUpdate, installUpdate, onUpdateStatus, currentVersion, rollback, rollbackVersion, openUpdateLog, autoCheckEnabled, setAutoCheck, type UpdateStatus } from "./updater";
 import pwshIcon from "./assets/pwsh.png";
 import cmdIcon from "./assets/cmd.png";
 
@@ -1092,6 +1092,14 @@ function renderLauncher() {
     row.onclick = () => { launcher.hidden = true; void rollback(); };
     launcher.append(row);
   }
+  const autoRow = el("div", "menu-item");
+  const autoLabel = el("span", "grow", "");
+  const renderAuto = () => (autoLabel.textContent = `自动检查更新：${autoCheckEnabled() ? "开" : "关"}`);
+  renderAuto();
+  autoRow.append(el("span", "glyph", String.fromCodePoint(0xe713)), autoLabel);
+  autoRow.title = "开启时每 6 小时访问 github.com 检查新版本；关闭后只在你点“检查更新”时联网";
+  autoRow.onclick = () => { setAutoCheck(!autoCheckEnabled()); renderAuto(); };
+  launcher.append(autoRow);
   const logRow = el("div", "menu-item");
   logRow.append(el("span", "glyph", String.fromCodePoint(0xe8a5)), el("span", "grow", "查看更新日志"));
   logRow.onclick = () => { launcher.hidden = true; openUpdateLog(); };

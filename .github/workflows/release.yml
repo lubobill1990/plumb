@@ -1,21 +1,56 @@
 name: Release
 
-# Push a tag like v0.2.0 (matching "version" in src-tauri/tauri.conf.json) to publish
-# a GitHub Release with the Windows installer attached.
+# Push a tag like v0.2.0 (matching "version" in src-tauri/tauri.conf.json) to publish a
+# GitHub Release: the Windows installer, its updater signature and latest.json.
+#
+# Code signing (Authenticode) is done by SignPath (free for OSS, certificate by SignPath
+# Foundation) once the repo variable SIGNPATH_ORGANIZATION_ID is set; until then the
+# release is published unsigned. See docs/code-signing.md.
+#
+# Order matters:
+#   1. build plumb.exe
+#   2. bundle once: Tauri's bundler patches the bundle type into a copy of the exe; take
+#      that patched exe out of the installer
+#   3. Authenticode-sign it (SignPath; a manual approval in SignPath for every release)
+#   4. bundle again from the signed exe: the patch rewrites identical bytes, so the
+#      embedded plumb.exe keeps its signature
+#   5. Authenticode-sign the installer (second approval)
+#   6. minisign-sign the final installer for the in-app updater, write latest.json
+#   7. publish
 on:
   push:
     tags: ["v*"]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Tag to (re)publish, e.g. v0.1.2 (must match the version)
+        required: true
+      dry_run:
+        description: Build and sign everything from this branch, but upload the files as a workflow artifact instead of publishing
+        type: boolean
+        default: false
 
 permissions:
   contents: write
+  actions: read
+
+env:
+  TAG: ${{ github.event.inputs.tag || github.ref_name }}
+  SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+  BUNDLE_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
 
 jobs:
   release:
     runs-on: windows-latest
-    timeout-minutes: 40
+    # two manual SignPath approvals may sit in the queue for a while
+    timeout-minutes: 360
+    defaults:
+      run:
+        shell: pwsh
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || env.TAG }}
 
       - uses: actions/setup-node@v4
         with:
@@ -30,18 +65,151 @@ jobs:
 
       - run: npm ci
 
-      - uses: tauri-apps/tauri-action@v0
+      - name: Version must match the tag
+        id: v
+        run: |
+          $v = (Get-Content src-tauri/tauri.conf.json -Raw | ConvertFrom-Json).version
+          if ("v$v" -ne $env:TAG) { throw "tag $env:TAG does not match version $v in tauri.conf.json" }
+          "version=$v" >> $env:GITHUB_OUTPUT
+          "installer=Plumb_${v}_x64-setup.exe" >> $env:GITHUB_OUTPUT
+
+      - name: Build plumb.exe
+        run: npx tauri build --ci --no-bundle
+
+      - name: Bundle once (patches the bundle type into the exe)
+        run: npx tauri bundle --ci --bundles nsis --config $env:BUNDLE_CONFIG
+
+      - name: Take the patched exe out of the installer
+        run: |
+          $installer = "src-tauri/target/release/bundle/nsis/${{ steps.v.outputs.installer }}"
+          7z x -y -ounpacked $installer plumb.exe | Out-Null
+          New-Item -ItemType Directory -Force to-sign/exe | Out-Null
+          Copy-Item unpacked/plumb.exe to-sign/exe/plumb.exe
+
+      # ---- Authenticode: plumb.exe ----
+      - name: Upload exe for signing
+        if: env.SIGN == 'true'
+        id: up-exe
+        uses: actions/upload-artifact@v4
+        with:
+          name: plumb-exe-unsigned
+          path: to-sign/exe/plumb.exe
+          if-no-files-found: error
+
+      - name: Sign plumb.exe (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'plumb' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: exe
+          github-artifact-id: ${{ steps.up-exe.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 18000
+          output-artifact-directory: signed/exe
+          parameters: |
+            version: "${{ steps.v.outputs.version }}"
+
+      - name: Put the signed exe back
+        if: env.SIGN == 'true'
+        run: |
+          $s = Get-AuthenticodeSignature signed/exe/plumb.exe
+          if ($s.Status -ne 'Valid') { throw "signed plumb.exe: $($s.Status) $($s.StatusMessage)" }
+          "signed by: $($s.SignerCertificate.Subject)"
+          Copy-Item signed/exe/plumb.exe src-tauri/target/release/plumb.exe -Force
+
+      - name: Bundle the installer
+        run: |
+          Remove-Item src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue
+          npx tauri bundle --ci --bundles nsis --config $env:BUNDLE_CONFIG
+          if ($env:SIGN -eq 'true') {
+            # the embedded exe must still carry its signature
+            Remove-Item unpacked -Recurse -Force -ErrorAction SilentlyContinue
+            7z x -y -ounpacked "src-tauri/target/release/bundle/nsis/${{ steps.v.outputs.installer }}" plumb.exe | Out-Null
+            $s = Get-AuthenticodeSignature unpacked/plumb.exe
+            if ($s.Status -ne 'Valid') { throw "plumb.exe inside the installer: $($s.Status)" }
+          }
+          New-Item -ItemType Directory -Force to-sign/installer | Out-Null
+          Copy-Item "src-tauri/target/release/bundle/nsis/${{ steps.v.outputs.installer }}" to-sign/installer/
+
+      # ---- Authenticode: the installer ----
+      - name: Upload installer for signing
+        if: env.SIGN == 'true'
+        id: up-installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: plumb-installer-unsigned
+          path: to-sign/installer/${{ steps.v.outputs.installer }}
+          if-no-files-found: error
+
+      - name: Sign the installer (SignPath)
+        if: env.SIGN == 'true'
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG || 'plumb' }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG || 'release-signing' }}
+          artifact-configuration-slug: installer
+          github-artifact-id: ${{ steps.up-installer.outputs.artifact-id }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 18000
+          output-artifact-directory: signed/installer
+          parameters: |
+            version: "${{ steps.v.outputs.version }}"
+
+      - name: Collect the release files
+        run: |
+          New-Item -ItemType Directory -Force dist-release | Out-Null
+          $src = if ($env:SIGN -eq 'true') { 'signed/installer' } else { 'to-sign/installer' }
+          Copy-Item "$src/${{ steps.v.outputs.installer }}" dist-release/
+          $s = Get-AuthenticodeSignature "dist-release/${{ steps.v.outputs.installer }}"
+          "installer signature: $($s.Status) $($s.SignerCertificate.Subject)"
+          if ($env:SIGN -eq 'true' -and $s.Status -ne 'Valid') { throw "installer not validly signed" }
+
+      # ---- in-app updater: minisign signature of the FINAL installer + latest.json ----
+      - name: Updater signature + latest.json
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # minisign key that signs the installer for the in-app updater (latest.json)
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          $installer = "dist-release/${{ steps.v.outputs.installer }}"
+          npx tauri signer sign $installer
+          if (-not (Test-Path "$installer.sig")) { throw "no updater signature" }
+          $manifest = [ordered]@{
+            version  = "${{ steps.v.outputs.version }}"
+            notes    = "Plumb $env:TAG"
+            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            platforms = [ordered]@{
+              "windows-x86_64" = [ordered]@{
+                signature = (Get-Content "$installer.sig" -Raw).Trim()
+                url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/${{ steps.v.outputs.installer }}"
+              }
+            }
+          }
+          $manifest | ConvertTo-Json -Depth 5 | Set-Content dist-release/latest.json -Encoding utf8NoBOM
+          Get-Content dist-release/latest.json
+
+      - name: Dry run - keep the files as an artifact
+        if: inputs.dry_run
+        uses: actions/upload-artifact@v4
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: Plumb ${{ github.ref_name }}
-          releaseBody: |
-            Windows installer (NSIS). The app is not code-signed yet, so SmartScreen may
-            warn on first launch: click "More info" -> "Run anyway".
-          includeUpdaterJson: true
-          releaseDraft: false
-          prerelease: false
+          name: release-files
+          path: dist-release/
+
+      - name: Publish the release
+        if: ${{ !inputs.dry_run }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $signed = if ($env:SIGN -eq 'true') { 'The installer and plumb.exe are code-signed (certificate by SignPath Foundation).' } else { 'The installer is not code-signed yet, so Windows SmartScreen may warn on first launch: "More info" -> "Run anyway".' }
+          $notes = "Windows installer (NSIS, per-user). $signed`n`nInstalled copies (0.1.2+) offer this update in the title bar."
+          $files = Get-ChildItem dist-release | ForEach-Object FullName
+          gh release view $env:TAG *> $null
+          if ($LASTEXITCODE -eq 0) {
+            gh release upload $env:TAG @files --clobber
+          } else {
+            gh release create $env:TAG @files --title "Plumb $env:TAG" --notes $notes --verify-tag
+          }

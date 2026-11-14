@@ -18,6 +18,15 @@ import { ask, message } from "@tauri-apps/plugin-dialog";
 const FIRST_CHECK_MS = 15_000;
 const CHECK_EVERY_MS = 6 * 60 * 60 * 1000;
 const SKIP_KEY = "updateSkipped";
+const AUTO_KEY = "autoUpdateCheck";
+
+/** Background checks contact github.com; the user can turn them off (manual checks still work). */
+export function autoCheckEnabled() {
+  return localStorage.getItem(AUTO_KEY) !== "0";
+}
+export function setAutoCheck(on: boolean) {
+  localStorage.setItem(AUTO_KEY, on ? "1" : "0");
+}
 
 interface Available { version: string; notes: string; url: string }
 interface UpdateInfo { current: string; available: Available | null; rollback: string | null }
@@ -176,6 +185,7 @@ export async function initUpdater(bannerEl: HTMLElement, opts: { autoCheck: bool
   renderBanner();
 
   if (!opts.autoCheck) return;
-  setTimeout(() => void checkForUpdate(), FIRST_CHECK_MS);
-  setInterval(() => void checkForUpdate(), CHECK_EVERY_MS);
+  const auto = () => { if (autoCheckEnabled()) void checkForUpdate(); };
+  setTimeout(auto, FIRST_CHECK_MS);
+  setInterval(auto, CHECK_EVERY_MS);
 }
