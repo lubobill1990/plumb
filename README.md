@@ -59,6 +59,28 @@ npm run tauri dev      # run with hot reload
 npm run tauri build    # installer in src-tauri/target/release/bundle/nsis
 ```
 
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by
+[SignPath Foundation](https://signpath.org) *(application in progress; until it is
+approved, releases are published unsigned)*.
+
+- Committers and reviewers: [@lubobill1990](https://github.com/lubobill1990)
+- Approvers: [@lubobill1990](https://github.com/lubobill1990)
+
+Every release is built from this repository by GitHub Actions
+([release workflow](.github/workflows/release.yml)); each signing request is approved
+manually. Details: [docs/code-signing.md](docs/code-signing.md).
+
+### Privacy
+
+This program will not transfer any information to other networked systems unless
+specifically requested by the user or the person installing or operating it. The only
+network access Plumb makes on its own is the update check: a request to github.com for
+this repository's latest release (and the installer download when an update is
+found). It sends no data beyond a standard HTTP request. Turn it off in the ⌄ menu
+("自动检查更新"); "检查更新" then checks only when you click it.
+
 ## Credits
 
 - [xterm.js](https://xtermjs.org), [Tauri](https://tauri.app), [portable-pty](https://crates.io/crates/portable-pty)
