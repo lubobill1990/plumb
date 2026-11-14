@@ -5,6 +5,7 @@ import { WebglAddon } from "@xterm/addon-webgl";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SerializeAddon } from "@xterm/addon-serialize";
 import { SearchAddon } from "@xterm/addon-search";
+import { ClipboardAddon } from "@xterm/addon-clipboard";
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { emitTo } from "@tauri-apps/api/event";
 import { getCurrentWindow } from "@tauri-apps/api/window";
@@ -14,6 +15,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 import { AGENT_ICONS } from "./icons";
+import { initUpdater, checkForUpdate, installUpdate, onUpdateStatus, currentVersion, rollback, rollbackVersion, openUpdateLog, type UpdateStatus } from "./updater";
 import pwshIcon from "./assets/pwsh.png";
 import cmdIcon from "./assets/cmd.png";
 
@@ -149,13 +151,23 @@ class Tab {
       findCount.textContent = resultCount ? `${resultIndex + 1}/${resultCount}` : "无结果";
     });
 
-    // Right click: copy the selection, or paste when nothing is selected (Windows Terminal).
+    // OSC 52: apps (Claude Code, vim, tmux ...) copy to the system clipboard through the
+    // terminal. Writes only — like Windows Terminal, apps may not read the clipboard.
+    this.term.loadAddon(new ClipboardAddon({
+      readText: () => "",
+      writeText: (_sel, text) => navigator.clipboard.writeText(text).catch(() => {}),
+    }));
+
+    // Right click (Windows Terminal rules): copy our selection, else paste — unless the app
+    // has turned on mouse reporting (Claude Code does). Then the click is the app's: xterm
+    // already forwarded it, and the app selects / copies on its own. Pasting as well put the
+    // old clipboard into the prompt. Shift+right-click always does copy/paste.
     this.host.addEventListener("contextmenu", (e) => {
       e.preventDefault();
       if (this.term.hasSelection()) {
         void navigator.clipboard.writeText(this.term.getSelection());
         this.term.clearSelection();
-      } else {
+      } else if (this.term.modes.mouseTrackingMode === "none" || e.shiftKey) {
         void navigator.clipboard.readText().then((t) => t && this.term.paste(t)).catch(() => {});
       }
       this.term.focus();
@@ -1042,6 +1054,48 @@ function renderLauncher() {
     launcher.append(el("div", "menu-label", "Agent"));
     launcher.append(el("div", "menu-note", "PATH 中未检测到 agent CLI（支持 claude、copilot、codex、gemini、qwen、opencode、cursor-agent、amp、aider …）"));
   }
+
+  // footer: version + "check for updates"
+  launcher.append(el("div", "menu-sep"));
+  const foot = el("div", "menu-item update-row");
+  const ver = el("span", "grow version", "Plumb");
+  const action = el("span", "update-action", "");
+  foot.append(el("span", "glyph", "\uE895"), ver, action);
+  void currentVersion.then((v) => (ver.textContent = `Plumb ${v}`));
+  const show = (s: UpdateStatus) => {
+    const text: Record<UpdateStatus["kind"], string> = {
+      idle: "检查更新",
+      checking: "正在检查…",
+      uptodate: "已是最新版本",
+      downloading: s.kind === "downloading" ? `下载 ${s.version}${s.percent !== null ? ` ${s.percent}%` : "…"}` : "",
+      ready: s.kind === "ready" ? `重启以更新到 ${s.version}` : "",
+      installing: "正在安装…",
+      error: "检查失败，点击重试",
+    };
+    action.textContent = text[s.kind];
+    foot.title = s.kind === "error" ? s.message : "";
+  };
+  const off = onUpdateStatus(show);
+  new MutationObserver(() => { if (!foot.isConnected) off(); }).observe(launcher, { childList: true });
+  foot.onclick = () => {
+    void (async () => {
+      const kind = (await checkForUpdate(true)).kind;
+      if (kind === "ready") { launcher.hidden = true; void installUpdate(); }
+    })();
+  };
+  launcher.append(foot);
+  const rb = rollbackVersion();
+  if (rb) {
+    const row = el("div", "menu-item");
+    row.append(el("span", "glyph", String.fromCodePoint(0xe7a7)), el("span", "grow", `回滚到 ${rb}`));
+    row.title = "恢复上次更新前备份的版本";
+    row.onclick = () => { launcher.hidden = true; void rollback(); };
+    launcher.append(row);
+  }
+  const logRow = el("div", "menu-item");
+  logRow.append(el("span", "glyph", String.fromCodePoint(0xe8a5)), el("span", "grow", "查看更新日志"));
+  logRow.onclick = () => { launcher.hidden = true; openUpdateLog(); };
+  launcher.append(logRow);
 }
 
 launchBtn.onclick = () => (launcher.hidden ? void openLauncher() : closeLauncher());
@@ -1064,6 +1118,11 @@ async function init() {
   const attachId = (window as { __ATTACH__?: number | null }).__ATTACH__;
   if (attachId != null) await adoptTab(attachId);
   else await newTab();
+
+  // Only the first window polls GitHub; dev builds never do (no signed release to compare).
+  void initUpdater($<HTMLElement>("#update-banner"), {
+    autoCheck: thisWebview.label === "main" && !import.meta.env.DEV,
+  });
 }
 
 void init();

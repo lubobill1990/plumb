@@ -33,11 +33,15 @@ jobs:
       - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # minisign key that signs the installer for the in-app updater (latest.json)
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Plumb ${{ github.ref_name }}
           releaseBody: |
             Windows installer (NSIS). The app is not code-signed yet, so SmartScreen may
             warn on first launch: click "More info" -> "Run anyway".
+          includeUpdaterJson: true
           releaseDraft: false
           prerelease: false
