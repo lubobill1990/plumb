@@ -254,3 +254,32 @@ select.flat option { background: #2b2b2b; }
 .picon.fallback { color: #d97757; font-size: 13px; }
 .tab .ticon { display: flex; flex: none; pointer-events: none; }
 .tab .ticon:empty { display: none; }
+
+/* ---- update banner (title bar) + launcher footer ---- */
+#update-banner {
+  align-self: center;
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 24px;
+  margin-right: 6px;
+  padding: 0 4px 0 10px;
+  border-radius: 12px;
+  background: #1f3d2b;
+  border: 1px solid #2f6b46;
+  color: #9be3b4;
+  font-size: 12px;
+  white-space: nowrap;
+}
+#update-banner[hidden] { display: none; }
+#update-banner .label { cursor: pointer; }
+#update-banner .label:hover { color: #fff; text-decoration: underline; }
+#update-banner .skip {
+  width: 18px; height: 18px; line-height: 18px; text-align: center;
+  border-radius: 50%; opacity: 0.6; font-size: 10px; cursor: pointer;
+}
+#update-banner .skip:hover { opacity: 1; background: #2f6b46; }
+.update-row .version { color: #999; }
+.update-row .update-action { color: #8ab4f8; font-size: 12px; }
+#update-banner.bad { background: #3d1f1f; border-color: #6b2f2f; color: #f3a5a5; }
+#update-banner.bad .skip:hover { background: #6b2f2f; }
