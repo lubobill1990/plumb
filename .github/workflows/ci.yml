@@ -69,6 +69,9 @@ jobs:
 
       - name: Bundle
         shell: bash
+        env:
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
         # PRs have no signing key: skip the updater artifacts (.sig / latest.json) here
         run: npx tauri build --ci --bundles ${{ matrix.bundles }} ${{ matrix.target && format('--target {0}', matrix.target) || '' }} --config '{"bundle":{"createUpdaterArtifacts":false}}'
 

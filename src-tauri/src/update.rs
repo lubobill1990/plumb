@@ -35,6 +35,7 @@ const PUBKEY_FILE: &str = include_str!("../updater.pub");
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Uninstall entry written by the NSIS installer (per-user install).
+#[cfg(windows)]
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Plumb";
 
 #[cfg(windows)]

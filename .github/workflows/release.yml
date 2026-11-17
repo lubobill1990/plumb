@@ -306,7 +306,12 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Build
-        run: npx tauri build --ci --bundles appimage,deb --config "$BUNDLE_CONFIG"
+        env:
+          # linuxdeploy: its strip chokes on newer libraries; no FUSE needed for its own AppImages
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        # linuxdeploy fails intermittently; one retry, verbose so a failure says why
+        run: npx tauri build --ci --verbose --bundles appimage,deb --config "$BUNDLE_CONFIG" || npx tauri build --ci --verbose --bundles appimage,deb --config "$BUNDLE_CONFIG"
 
       - name: Collect the Linux files
         run: |
