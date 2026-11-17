@@ -22,6 +22,8 @@ else
   exe() { echo "$target"; }
 fi
 upd="$data/updates"
+applog="$HOME/plumb-e2e-app.log"
+: >"$applog"
 dl="$upd/downloads"
 
 check() { if eval "$2"; then echo "  PASS $1"; else echo "  FAIL $1 :: $3"; fail=$((fail + 1)); fi; }
@@ -38,7 +40,7 @@ install_a() {
 run_updater() {
   local cmd=$1 from=$2
   kill_plumb
-  "$(exe)" >/dev/null 2>&1 &
+  "$(exe)" >>"$applog" 2>&1 &
   local app=$!
   local t=0
   while [ ! -e "$upd/healthy-$from" ] && [ $t -lt 60 ]; do sleep 1; t=$((t + 1)); done
@@ -98,6 +100,8 @@ run_updater "apply --version $C" "$B"
 check "refused before touching anything" '[ "$(state result)" = failed ] && case "$(state message)" in 未安装*) true;; *) false;; esac' "$(state message)"
 check "still $B" '[ "$(ver)" = "$B" ]' "$(ver)"
 
+echo "== app output (tail)"
+tail -40 "$applog"
 echo "== update.log (tail)"
 tail -40 "$upd/update.log" 2>/dev/null
 kill_plumb
