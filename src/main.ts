@@ -93,6 +93,14 @@ class Tab {
   customTitle: string | null = null;
   color: string | null = null;
   private lastInput = { data: "", at: 0 };
+  /**
+   * One IME commit: a composition ending (a word chosen), or a key pressed while the IME
+   * is on but not composing (keyCode 229: full-width punctuation). xterm 5.5 can deliver
+   * that text twice — from its textarea diff and from the `input` event — and under load
+   * the two arrive far apart. The first delivery passes; an identical second one in the
+   * same commit is dropped. Any other key, or the next composition, starts a new one.
+   */
+  private imeCommit: { text: string | null; sent: string | null; at: number } | null = null;
 
   constructor(public profile: Profile, public cwd: string | null = null) {
     this.title = this.autoTitle = profile.name;
@@ -177,11 +185,21 @@ class Tab {
     this.term.onTitleChange((t) => this.setTitle(t || this.profile.name));
     this.term.onData((data) => {
       if (this.exited) return this.close();
-      // xterm 5.5 + an active IME: a punctuation key (keyCode 229, no composition) is sent
-      // twice — once from the textarea diff (CompositionHelper, setTimeout 0) and once from
-      // the `input` event. The copies land a few ms apart; a human can't repeat that fast.
       const now = performance.now();
-      const dup = data === this.lastInput.data && now - this.lastInput.at < 30 && /[^\x00-\x7f]/.test(data);
+      const nonAscii = /[^\x00-\x7f]/.test(data);
+      const c = this.imeCommit;
+      if (c && nonAscii && now - c.at < 2000) {
+        if (c.sent !== null) {
+          if (data === c.sent) return; // the same commit delivered again
+        } else if (c.text !== null && data === c.text + c.text) {
+          data = c.text; // delivered as one doubled string
+          c.sent = data;
+        } else if (c.text === null || data === c.text) {
+          c.sent = data;
+        }
+      }
+      // fallback: an identical non-ASCII input within 30 ms (no human repeats that fast)
+      const dup = data === this.lastInput.data && now - this.lastInput.at < 30 && nonAscii;
       this.lastInput = { data, at: now };
       if (dup) return;
       this.write(data);
@@ -246,6 +264,17 @@ class Tab {
    * and slides the preview left so it stays fully visible.
    */
   private guardIme() {
+    const ta = this.term.textarea;
+    if (ta) {
+      ta.addEventListener("compositionstart", () => { this.imeCommit = null; }, true);
+      ta.addEventListener("compositionend", (e) => {
+        this.imeCommit = { text: e.data || null, sent: null, at: performance.now() };
+      }, true);
+      ta.addEventListener("keydown", (e) => {
+        if (e.keyCode === 229 && !e.isComposing) this.imeCommit = { text: null, sent: null, at: performance.now() };
+        else if (e.keyCode !== 229) this.imeCommit = null; // a normal key: typing goes on as usual
+      }, true);
+    }
     const viewport = this.host.querySelector(".xterm-viewport");
     this.host.addEventListener("scroll", (e) => {
       const t = e.target as HTMLElement;
