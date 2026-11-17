@@ -9,10 +9,12 @@ name: Updater E2E
 on:
   workflow_dispatch:
   pull_request:
+    # any app code: the scenarios start the real app (a Linux startup crash in lib.rs
+    # showed up here first)
     paths:
-      - src-tauri/src/update.rs
-      - src-tauri/src/main.rs
-      - src/updater.ts
+      - src-tauri/src/**
+      - src-tauri/tauri*.json
+      - src/**
       - scripts/updater-e2e/**
       - .github/workflows/updater-e2e.yml
 

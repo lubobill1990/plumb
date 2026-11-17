@@ -754,7 +754,12 @@ fn create_preview(app: &AppHandle) -> tauri::Result<()> {
         .focusable(false)
         .visible(false)
         .build()?;
+    // Linux: a hidden GTK window has no GdkWindow yet and tao unwraps it here (panic at
+    // startup, "Option::unwrap() on a None value"), so there it's set once shown.
+    #[cfg(not(target_os = "linux"))]
     w.set_ignore_cursor_events(true)?;
+    #[cfg(target_os = "linux")]
+    let _ = &w;
     Ok(())
 }
 
@@ -781,6 +786,8 @@ fn drag_preview(app: AppHandle, phase: String, info: Option<PreviewInfo>) -> Res
     w.set_position(pos).map_err(|e| e.to_string())?;
     if phase == "show" && !w.is_visible().unwrap_or(false) {
         w.show().map_err(|e| e.to_string())?;
+        #[cfg(target_os = "linux")]
+        let _ = w.set_ignore_cursor_events(true);
     }
     Ok(())
 }
