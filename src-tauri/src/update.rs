@@ -265,7 +265,15 @@ pub fn spawn_updater(args: &[String]) -> Result<(), String> {
     let dir = updates_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let updater = dir.join("plumb-updater.exe");
-    fs::copy(std::env::current_exe().map_err(|e| e.to_string())?, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // A hard link (same file, second name; same volume: both under %LOCALAPPDATA%), not a
+    // copy. An unsigned app writing a copy of itself into AppData and running it is what
+    // Defender's ML flagged (Trojan:Win32/Bearfoos.B!ml) - then it quarantined Plumb.
+    let _ = fs::remove_file(&updater);
+    if let Err(e) = fs::hard_link(&exe, &updater) {
+        log(&format!("hard link failed ({e}); copying the updater instead"));
+        fs::copy(&exe, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
+    }
     let mut cmd = Command::new(&updater);
     cmd.arg("--updater").args(args).current_dir(&dir);
     #[cfg(windows)]
@@ -363,18 +371,17 @@ fn wait_exit(pid: u32, timeout: Duration) -> bool {
     false
 }
 
-fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
-    fs::create_dir_all(to)?;
-    for e in fs::read_dir(from)? {
-        let e = e?;
-        let target = to.join(e.file_name());
-        if e.file_type()?.is_dir() {
-            copy_tree(&e.path(), &target)?;
-        } else {
-            fs::copy(e.path(), &target)?;
+/// Rename with retries: a just-exited / just-killed process can hold its exe for a moment.
+fn rename_retry(from: &Path, to: &Path) -> Result<(), String> {
+    let mut last = String::new();
+    for _ in 0..20 {
+        match fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(e) => last = e.to_string(),
         }
+        std::thread::sleep(Duration::from_millis(500));
     }
-    Ok(())
+    Err(format!("{} → {}：{last}", from.display(), to.display()))
 }
 
 fn set_registered_version(version: &str) {
@@ -399,21 +406,61 @@ fn installed_version(dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn launch(dir: &Path) -> Option<u32> {
-    let mut cmd = Command::new(dir.join("plumb.exe"));
+fn launch(dir: &Path) -> Result<u32, String> {
+    let exe = dir.join("plumb.exe");
+    let mut cmd = Command::new(&exe);
     cmd.current_dir(dir);
     #[cfg(windows)]
     cmd.creation_flags(DETACHED);
-    cmd.spawn().ok().map(|c| c.id())
+    cmd.spawn().map(|c| c.id()).map_err(|e| format!("{}：{e}", exe.display()))
 }
 
-/// Back up the install dir; returns the version actually backed up (asked from the exe,
-/// not taken from the caller, so a rollback restores and registers the truth).
+/// Native message box (the updater has no window of its own).
+fn alert(text: &str) {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
+        }
+        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        const MB_ICONERROR: u32 = 0x10;
+        const MB_TOPMOST: u32 = 0x4_0000;
+        unsafe {
+            MessageBoxW(0, wide(text).as_ptr(), wide("Plumb 更新").as_ptr(), MB_ICONERROR | MB_TOPMOST);
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = text;
+}
+
+/// Start Plumb again after the updater is done. Never leave the user with nothing: if it
+/// won't start, say why and where the log is.
+fn relaunch(dir: &Path, outcome: &str) {
+    match launch(dir) {
+        Ok(pid) => log(&format!("relaunched Plumb (pid {pid})")),
+        Err(e) => {
+            log(&format!("could not relaunch Plumb: {e}"));
+            alert(&format!(
+                "{outcome}\n\n无法重新启动 Plumb：{e}\n\n请从开始菜单打开 Plumb，或重新安装最新版：\nhttps://github.com/lubobill1990/plumb/releases/latest\n\n更新日志：{}",
+                log_path().display()
+            ));
+        }
+    }
+}
+
+/// Back up the install dir by **moving** it into updates\rollback (same volume: a rename,
+/// no file content is read or written). Copying made this unsigned updater write a batch
+/// of executables, which antivirus (Defender on a managed PC) blocked with "the file
+/// contains a virus or potentially unwanted software" (os error 225). Returns the version
+/// actually backed up (asked from the exe, not taken from the caller).
 fn backup(dir: &Path, claimed: &str) -> Result<String, String> {
     let version = installed_version(dir).filter(|v| !v.is_empty()).unwrap_or_else(|| claimed.to_string());
     let rb = rollback_dir();
-    let _ = fs::remove_dir_all(&rb);
-    copy_tree(dir, &rb).map_err(|e| format!("备份失败：{e}"))?;
+    if rb.exists() {
+        fs::remove_dir_all(&rb).map_err(|e| format!("备份失败：无法清理旧备份 {}：{e}", rb.display()))?;
+    }
+    rename_retry(dir, &rb).map_err(|e| format!("备份失败：{e}"))?;
     fs::write(rb.join("VERSION"), &version).map_err(|e| e.to_string())?;
     Ok(version)
 }
@@ -430,23 +477,20 @@ fn precheck(s: &UpdateState) -> Result<(), String> {
     Ok(())
 }
 
+/// Put the backed-up install back: move whatever is installed now aside, move the backup
+/// into place (renames only), register its version.
 fn restore(dir: &Path) -> Result<String, String> {
     let rb = rollback_dir();
     let version = fs::read_to_string(rb.join("VERSION")).map_err(|_| "没有备份可恢复".to_string())?.trim().to_string();
-    // the installer may leave the new exe running for a moment; retry the copy
-    let mut last = String::new();
-    for _ in 0..10 {
-        match copy_tree(&rb, dir) {
-            Ok(()) => {
-                let _ = fs::remove_file(dir.join("VERSION"));
-                set_registered_version(&version);
-                return Ok(version);
-            }
-            Err(e) => last = e.to_string(),
-        }
-        std::thread::sleep(Duration::from_millis(500));
+    if dir.exists() {
+        let aside = updates_dir().join(format!("replaced-{}", now()));
+        rename_retry(dir, &aside).map_err(|e| format!("恢复备份失败：{e}"))?;
+        let _ = fs::remove_dir_all(&aside); // best effort; a leftover is harmless
     }
-    Err(format!("恢复备份失败：{last}"))
+    rename_retry(&rb, dir).map_err(|e| format!("恢复备份失败：{e}"))?;
+    let _ = fs::remove_file(dir.join("VERSION"));
+    set_registered_version(&version);
+    Ok(version)
 }
 
 /// Run the installer, check the result, health-check the new version. Err = roll back.
@@ -471,7 +515,7 @@ fn install_and_check(s: &mut UpdateState, dir: &Path) -> Result<(), String> {
     phase(s, "health-check", "启动新版本，等待它报告正常");
     let marker = health_marker(&s.to);
     let _ = fs::remove_file(&marker);
-    let pid = launch(dir).ok_or("无法启动新版本")?;
+    let pid = launch(dir).map_err(|e| format!("无法启动新版本：{e}"))?;
     let t = Instant::now();
     loop {
         if marker.exists() {
@@ -517,7 +561,7 @@ fn run_apply(args: &[String]) -> i32 {
     if let Err(why) = precheck(&s) {
         s.result = Some("failed".into());
         phase(&mut s, "done", &format!("未安装 {to}：{why}"));
-        launch(&dir);
+        relaunch(&dir, &s.message.clone());
         return 1;
     }
 
@@ -527,7 +571,7 @@ fn run_apply(args: &[String]) -> i32 {
         Err(e) => {
             s.result = Some("failed".into());
             phase(&mut s, "done", &format!("{e}；未安装任何东西"));
-            launch(&dir);
+            relaunch(&dir, &s.message.clone());
             return 1;
         }
     };
@@ -551,7 +595,7 @@ fn run_apply(args: &[String]) -> i32 {
                     phase(&mut s, "done", &format!("更新到 {to} 失败（{why}），回滚也失败（{e}）"));
                 }
             }
-            launch(&dir);
+            relaunch(&dir, &s.message.clone());
             1
         }
     }
@@ -587,7 +631,7 @@ fn run_rollback(args: &[String]) -> i32 {
             1
         }
     };
-    launch(&dir);
+    relaunch(&dir, &s.message.clone());
     code
 }
 

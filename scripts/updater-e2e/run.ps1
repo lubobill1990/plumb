@@ -24,7 +24,9 @@ function RunUpdater($cmd, $from) {
   $t = 0; while (-not (Test-Path "$upd\healthy-$from") -and $t -lt 40) { Start-Sleep 1; $t++ }
   Write-Host "  running $from reported healthy after ${t}s: $(Test-Path "$upd\healthy-$from")"
   New-Item -Force -ItemType Directory $upd | Out-Null
-  Copy-Item "$ins\plumb.exe" "$upd\plumb-updater.exe" -Force
+  # like the app: a hard link to the running exe, not a copy (see update.rs spawn_updater)
+  Remove-Item "$upd\plumb-updater.exe" -Force -ErrorAction SilentlyContinue
+  New-Item -ItemType HardLink -Path "$upd\plumb-updater.exe" -Target "$ins\plumb.exe" | Out-Null
   $u = Start-Process "$upd\plumb-updater.exe" -ArgumentList "--updater $cmd --from $from --install-dir `"$ins`" --pid $($app.Id)" -PassThru
   Start-Sleep 2
   Stop-Process -Id $app.Id -Force
