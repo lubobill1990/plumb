@@ -35,6 +35,7 @@ const PUBKEY_FILE: &str = include_str!("../updater.pub");
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Uninstall entry written by the NSIS installer (per-user install).
+#[cfg(windows)]
 const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Plumb";
 
 #[cfg(windows)]
@@ -48,20 +49,59 @@ pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
 }
 
+/// The update package for this platform. The name is in the minisign trusted comment, so
+/// it carries the version (an older release's signature can't be replayed).
 pub fn installer_name(version: &str) -> String {
-    format!("Plumb_{version}_x64-setup.exe")
+    if cfg!(windows) {
+        format!("Plumb_{version}_x64-setup.exe")
+    } else if cfg!(target_os = "macos") {
+        format!("Plumb_{version}_universal.app.tar.gz")
+    } else {
+        format!("Plumb_{version}_amd64.AppImage")
+    }
+}
+
+/// latest.json "platforms" keys for this build, in order of preference.
+fn platform_keys() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &["windows-x86_64-nsis", "windows-x86_64"]
+    } else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        &["darwin-aarch64", "darwin-universal"]
+    } else if cfg!(target_os = "macos") {
+        &["darwin-x86_64", "darwin-universal"]
+    } else if cfg!(target_arch = "aarch64") {
+        &["linux-aarch64"]
+    } else {
+        &["linux-x86_64"]
+    }
+}
+
+fn sig_path(file: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.sig", file.display()))
 }
 
 // ---------------------------------------------------------------------------
 // paths, log, state
 // ---------------------------------------------------------------------------
 
-/// Outside the install dir (%LOCALAPPDATA%\Plumb): the backup copies the install dir, and
-/// the installer may clean it while the updater runs. This is the app's data dir (named
-/// after the bundle identifier), next to the WebView2 profile.
+/// The app's data dir, named after the bundle identifier (Tauri's app_local_data_dir):
+/// %LOCALAPPDATA%\…, ~/Library/Application Support/…, $XDG_DATA_HOME or ~/.local/share/….
+fn data_dir() -> PathBuf {
+    let home = || std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir)
+    } else if cfg!(target_os = "macos") {
+        home().join("Library").join("Application Support")
+    } else {
+        std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".local").join("share"))
+    };
+    base.join("com.lubobill1990.plumb")
+}
+
+/// Outside the install location: the backup moves the install aside, and the installer
+/// may clean the install dir while the updater runs.
 pub fn updates_dir() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    base.join("com.lubobill1990.plumb").join("updates")
+    data_dir().join("updates")
 }
 
 fn downloads_dir() -> PathBuf {
@@ -189,10 +229,11 @@ pub fn fetch_manifest() -> Result<Available, String> {
     let v: serde_json::Value = serde_json::from_str(&body).map_err(|e| format!("latest.json 无效：{e}"))?;
     let version = v["version"].as_str().ok_or("latest.json 缺少 version")?.trim_start_matches('v').to_string();
     let platforms = &v["platforms"];
-    let p = [&platforms["windows-x86_64-nsis"], &platforms["windows-x86_64"]]
-        .into_iter()
+    let p = platform_keys()
+        .iter()
+        .map(|k| &platforms[*k])
         .find(|p| p["url"].is_string())
-        .ok_or("latest.json 中没有 Windows 安装包")?;
+        .ok_or_else(|| format!("{version} 还没有这个平台（{}）的更新包", platform_keys()[0]))?;
     Ok(Available {
         notes: v["notes"].as_str().unwrap_or_default().to_string(),
         url: p["url"].as_str().unwrap_or_default().to_string(),
@@ -246,7 +287,7 @@ pub fn download(av: &Available, mut progress: impl FnMut(u64, Option<u64>)) -> R
     let tmp = path.with_extension("part");
     fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
     fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-    fs::write(path.with_extension("exe.sig"), &av.signature).map_err(|e| e.to_string())?;
+    fs::write(sig_path(&path), &av.signature).map_err(|e| e.to_string())?;
     log(&format!("downloaded and verified {} ({} bytes)", path.display(), bytes.len()));
     Ok(path)
 }
@@ -255,26 +296,61 @@ pub fn download(av: &Available, mut progress: impl FnMut(u64, Option<u64>)) -> R
 // handing over to the updater program
 // ---------------------------------------------------------------------------
 
-fn install_dir() -> Result<PathBuf, String> {
+/// What an update replaces: the install dir (Windows, NSIS per-user install), the .app
+/// bundle (macOS) or the AppImage file (Linux).
+fn install_target() -> Result<PathBuf, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    exe.parent().map(Path::to_path_buf).ok_or_else(|| "找不到安装目录".into())
+    if cfg!(windows) {
+        exe.parent().map(Path::to_path_buf).ok_or_else(|| "找不到安装目录".into())
+    } else if cfg!(target_os = "macos") {
+        exe.ancestors()
+            .find(|p| p.extension().is_some_and(|e| e == "app"))
+            .map(Path::to_path_buf)
+            .ok_or_else(|| "Plumb 不在 .app 包里运行，无法自动更新".into())
+    } else {
+        // inside an AppImage, current_exe() is in the temporary mount; $APPIMAGE is the file
+        std::env::var_os("APPIMAGE")
+            .map(PathBuf::from)
+            .ok_or_else(|| "这个 Plumb 不是 AppImage 版（比如用 deb 安装的），请用包管理器更新，或改用 AppImage".into())
+    }
 }
 
-/// Copy this exe out of the install dir and start it as the updater. The caller exits next.
+/// The executable of an installed target.
+fn target_exe(target: &Path) -> PathBuf {
+    if cfg!(windows) {
+        target.join("plumb.exe")
+    } else if cfg!(target_os = "macos") {
+        target.join("Contents").join("MacOS").join("plumb")
+    } else {
+        target.to_path_buf()
+    }
+}
+
+/// Start the updater as its own process (outside what it is about to replace). The caller
+/// exits next.
 pub fn spawn_updater(args: &[String]) -> Result<(), String> {
     let dir = updates_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let updater = dir.join("plumb-updater.exe");
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // A hard link (same file, second name; same volume: both under %LOCALAPPDATA%), not a
-    // copy. An unsigned app writing a copy of itself into AppData and running it is what
-    // Defender's ML flagged (Trojan:Win32/Bearfoos.B!ml) - then it quarantined Plumb.
-    let _ = fs::remove_file(&updater);
-    if let Err(e) = fs::hard_link(&exe, &updater) {
-        log(&format!("hard link failed ({e}); copying the updater instead"));
-        fs::copy(&exe, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
-    }
-    let mut cmd = Command::new(&updater);
+    let program = if cfg!(windows) {
+        // A hard link (same file, second name; same volume: both under %LOCALAPPDATA%),
+        // not a copy. An unsigned app writing a copy of itself into AppData and running it
+        // is what Defender's ML flagged (Trojan:Win32/Bearfoos.B!ml), then quarantined Plumb.
+        let updater = dir.join("plumb-updater.exe");
+        let _ = fs::remove_file(&updater);
+        if let Err(e) = fs::hard_link(&exe, &updater) {
+            log(&format!("hard link failed ({e}); copying the updater instead"));
+            fs::copy(&exe, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
+        }
+        updater
+    } else if let Some(appimage) = std::env::var_os("APPIMAGE") {
+        // run the AppImage file again: its own mount, which outlives this process's mount
+        PathBuf::from(appimage)
+    } else {
+        // macOS: a running binary can be moved with its bundle; run it in place
+        exe
+    };
+    let mut cmd = Command::new(&program);
     cmd.arg("--updater").args(args).current_dir(&dir);
     #[cfg(windows)]
     cmd.creation_flags(DETACHED);
@@ -287,7 +363,7 @@ pub fn start_apply(version: &str) -> Result<(), String> {
     if !installer.is_file() {
         return Err(format!("没有找到已下载的 {}", installer_name(version)));
     }
-    let dir = install_dir()?;
+    let dir = install_target()?;
     log(&format!("handing over to the updater: {} -> {version}", current_version()));
     write_state(&UpdateState {
         phase: "waiting".into(),
@@ -313,7 +389,7 @@ pub fn start_apply(version: &str) -> Result<(), String> {
 
 pub fn start_rollback() -> Result<(), String> {
     let to = rollback_version().ok_or("没有可回滚的版本")?;
-    let dir = install_dir()?;
+    let dir = install_target()?;
     write_state(&UpdateState {
         phase: "waiting".into(),
         from: current_version().into(),
@@ -343,21 +419,37 @@ fn arg(args: &[String], name: &str) -> Option<String> {
 }
 
 fn process_alive(pid: u32) -> bool {
-    let mut cmd = Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
     #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    cmd.output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-        .unwrap_or(false)
+    {
+        let mut cmd = Command::new("tasklist");
+        cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
+        cmd.creation_flags(NO_WINDOW);
+        cmd.output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .unwrap_or(false)
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
 }
 
 fn kill_tree(pid: u32) {
-    let mut cmd = Command::new("taskkill");
-    cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
     #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    let _ = cmd.output();
+    {
+        let mut cmd = Command::new("taskkill");
+        cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
+        cmd.creation_flags(NO_WINDOW);
+        let _ = cmd.output();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+    }
 }
 
 fn wait_exit(pid: u32, timeout: Duration) -> bool {
@@ -384,6 +476,10 @@ fn rename_retry(from: &Path, to: &Path) -> Result<(), String> {
     Err(format!("{} → {}：{last}", from.display(), to.display()))
 }
 
+fn remove_any(p: &Path) {
+    let _ = if p.is_dir() { fs::remove_dir_all(p) } else { fs::remove_file(p) };
+}
+
 fn set_registered_version(version: &str) {
     #[cfg(windows)]
     {
@@ -396,9 +492,9 @@ fn set_registered_version(version: &str) {
     let _ = version;
 }
 
-/// `plumb.exe --version` of the installed exe.
-fn installed_version(dir: &Path) -> Option<String> {
-    let mut cmd = Command::new(dir.join("plumb.exe"));
+/// `plumb --version` of the installed target.
+fn installed_version(target: &Path) -> Option<String> {
+    let mut cmd = Command::new(target_exe(target));
     cmd.arg("--version");
     #[cfg(windows)]
     cmd.creation_flags(NO_WINDOW);
@@ -406,17 +502,24 @@ fn installed_version(dir: &Path) -> Option<String> {
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-fn launch(dir: &Path) -> Result<u32, String> {
-    let exe = dir.join("plumb.exe");
+fn launch(target: &Path) -> Result<u32, String> {
+    let exe = target_exe(target);
     let mut cmd = Command::new(&exe);
-    cmd.current_dir(dir);
+    if let Some(dir) = exe.parent() {
+        cmd.current_dir(dir);
+    }
     #[cfg(windows)]
     cmd.creation_flags(DETACHED);
     cmd.spawn().map(|c| c.id()).map_err(|e| format!("{}：{e}", exe.display()))
 }
 
-/// Native message box (the updater has no window of its own).
+/// Native message box (the updater has no window of its own). PLUMB_UPDATER_NO_ALERT=1
+/// (E2E tests) logs instead: a modal box would wait for a click forever.
 fn alert(text: &str) {
+    if std::env::var_os("PLUMB_UPDATER_NO_ALERT").is_some() {
+        log(&format!("alert (suppressed): {text}"));
+        return;
+    }
     #[cfg(windows)]
     {
         #[link(name = "user32")]
@@ -430,84 +533,170 @@ fn alert(text: &str) {
             MessageBoxW(0, wide(text).as_ptr(), wide("Plumb 更新").as_ptr(), MB_ICONERROR | MB_TOPMOST);
         }
     }
-    #[cfg(not(windows))]
-    let _ = text;
+    #[cfg(target_os = "macos")]
+    {
+        let esc = text.replace('\\', "\\\\").replace('"', "\\\"");
+        let _ = Command::new("osascript")
+            .args(["-e", &format!("display alert \"Plumb 更新\" message \"{esc}\" as critical")])
+            .status();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let ok = Command::new("zenity")
+            .args(["--error", "--title=Plumb 更新", &format!("--text={text}")])
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            let _ = Command::new("notify-send").args(["-u", "critical", "Plumb 更新", text]).status();
+        }
+    }
 }
 
 /// Start Plumb again after the updater is done. Never leave the user with nothing: if it
 /// won't start, say why and where the log is.
-fn relaunch(dir: &Path, outcome: &str) {
-    match launch(dir) {
+fn relaunch(target: &Path, outcome: &str) {
+    match launch(target) {
         Ok(pid) => log(&format!("relaunched Plumb (pid {pid})")),
         Err(e) => {
             log(&format!("could not relaunch Plumb: {e}"));
             alert(&format!(
-                "{outcome}\n\n无法重新启动 Plumb：{e}\n\n请从开始菜单打开 Plumb，或重新安装最新版：\nhttps://github.com/lubobill1990/plumb/releases/latest\n\n更新日志：{}",
+                "{outcome}\n\n无法重新启动 Plumb：{e}\n\n请重新打开 Plumb，或重新安装最新版：\nhttps://github.com/lubobill1990/plumb/releases/latest\n\n更新日志：{}",
                 log_path().display()
             ));
         }
     }
 }
 
-/// Back up the install dir by **moving** it into updates\rollback (same volume: a rename,
-/// no file content is read or written). Copying made this unsigned updater write a batch
-/// of executables, which antivirus (Defender on a managed PC) blocked with "the file
-/// contains a virus or potentially unwanted software" (os error 225). Returns the version
-/// actually backed up (asked from the exe, not taken from the caller).
-fn backup(dir: &Path, claimed: &str) -> Result<String, String> {
-    let version = installed_version(dir).filter(|v| !v.is_empty()).unwrap_or_else(|| claimed.to_string());
+/// Where the backed-up install sits. Windows: the install dir itself becomes
+/// updates\rollback (VERSION inside); macOS / Linux: updates/rollback/<Plumb.app | file>.
+fn backup_item(target: &Path) -> PathBuf {
+    if cfg!(windows) {
+        rollback_dir()
+    } else {
+        rollback_dir().join(target.file_name().unwrap_or_default())
+    }
+}
+
+/// Back up the install by **moving** it (same volume: a rename, no file content read or
+/// written). Copying made the unsigned updater write a batch of executables, which
+/// Defender on a managed PC blocked (os error 225) and then quarantined Plumb. Returns the
+/// version actually backed up (asked from the exe, not taken from the caller).
+fn backup(target: &Path, claimed: &str) -> Result<String, String> {
+    let version = installed_version(target).filter(|v| !v.is_empty()).unwrap_or_else(|| claimed.to_string());
     let rb = rollback_dir();
     if rb.exists() {
         fs::remove_dir_all(&rb).map_err(|e| format!("备份失败：无法清理旧备份 {}：{e}", rb.display()))?;
     }
-    rename_retry(dir, &rb).map_err(|e| format!("备份失败：{e}"))?;
+    if !cfg!(windows) {
+        fs::create_dir_all(&rb).map_err(|e| format!("备份失败：{e}"))?;
+    }
+    rename_retry(target, &backup_item(target)).map_err(|e| format!("备份失败：{e}"))?;
     fs::write(rb.join("VERSION"), &version).map_err(|e| e.to_string())?;
     Ok(version)
 }
 
-/// Checks that need nothing changed yet: signature, version binding, strictly newer.
-fn precheck(s: &UpdateState) -> Result<(), String> {
+/// Checks that need nothing changed yet: signature, version binding, strictly newer, and
+/// that the install location can be replaced.
+fn precheck(s: &UpdateState, target: &Path) -> Result<(), String> {
     let installer = downloads_dir().join(installer_name(&s.to));
-    let signature = fs::read_to_string(installer.with_extension("exe.sig")).map_err(|_| "缺少签名文件".to_string())?;
+    let signature = fs::read_to_string(sig_path(&installer)).map_err(|_| "缺少签名文件".to_string())?;
     let bytes = fs::read(&installer).map_err(|e| format!("读取安装包失败：{e}"))?;
     verify(&bytes, &signature, &s.to)?; // again: the file sat on disk since the download
     if !is_newer(&s.to, &s.from) {
         return Err(format!("{} 不比 {} 新，拒绝安装", s.to, s.from));
+    }
+    if !cfg!(windows) {
+        let parent = target.parent().ok_or("找不到安装位置")?;
+        let probe = parent.join(format!(".plumb-write-test-{}", std::process::id()));
+        fs::write(&probe, b"").map_err(|e| format!("没有写入 {} 的权限：{e}", parent.display()))?;
+        let _ = fs::remove_file(&probe);
     }
     Ok(())
 }
 
 /// Put the backed-up install back: move whatever is installed now aside, move the backup
 /// into place (renames only), register its version.
-fn restore(dir: &Path) -> Result<String, String> {
+fn restore(target: &Path) -> Result<String, String> {
     let rb = rollback_dir();
     let version = fs::read_to_string(rb.join("VERSION")).map_err(|_| "没有备份可恢复".to_string())?.trim().to_string();
-    if dir.exists() {
+    if target.exists() {
         let aside = updates_dir().join(format!("replaced-{}", now()));
-        rename_retry(dir, &aside).map_err(|e| format!("恢复备份失败：{e}"))?;
-        let _ = fs::remove_dir_all(&aside); // best effort; a leftover is harmless
+        rename_retry(target, &aside).map_err(|e| format!("恢复备份失败：{e}"))?;
+        remove_any(&aside); // best effort; a leftover is harmless
     }
-    rename_retry(&rb, dir).map_err(|e| format!("恢复备份失败：{e}"))?;
-    let _ = fs::remove_file(dir.join("VERSION"));
+    rename_retry(&backup_item(target), target).map_err(|e| format!("恢复备份失败：{e}"))?;
+    if cfg!(windows) {
+        let _ = fs::remove_file(target.join("VERSION"));
+    } else {
+        let _ = fs::remove_dir_all(&rb);
+    }
     set_registered_version(&version);
     Ok(version)
 }
 
-/// Run the installer, check the result, health-check the new version. Err = roll back.
-fn install_and_check(s: &mut UpdateState, dir: &Path) -> Result<(), String> {
-    let installer = downloads_dir().join(installer_name(&s.to));
-    phase(s, "installing", &format!("运行 {}", installer_name(&s.to)));
-    let mut cmd = Command::new(&installer);
-    cmd.arg("/S");
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    let status = cmd.status().map_err(|e| format!("无法运行安装包：{e}"))?;
-    if !status.success() {
-        return Err(format!("安装包退出码 {}", status.code().unwrap_or(-1)));
+/// Put the new version where the old one was (the old one has been moved to the backup).
+fn install(installer: &Path, target: &Path) -> Result<(), String> {
+    if cfg!(windows) {
+        // NSIS per-user installer, silent
+        let mut cmd = Command::new(installer);
+        cmd.arg("/S");
+        #[cfg(windows)]
+        cmd.creation_flags(NO_WINDOW);
+        let status = cmd.status().map_err(|e| format!("无法运行安装包：{e}"))?;
+        if !status.success() {
+            return Err(format!("安装包退出码 {}", status.code().unwrap_or(-1)));
+        }
+    } else if cfg!(target_os = "macos") {
+        // unpack Plumb.app next to the downloads, then move it into place
+        let staging = updates_dir().join(format!("staging-{}", now()));
+        fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+        let status = Command::new("tar")
+            .arg("-xzf")
+            .arg(installer)
+            .arg("-C")
+            .arg(&staging)
+            .status()
+            .map_err(|e| format!("无法解压：{e}"))?;
+        if !status.success() {
+            remove_any(&staging);
+            return Err("解压更新包失败".into());
+        }
+        let app = fs::read_dir(&staging)
+            .map_err(|e| e.to_string())?
+            .filter_map(Result::ok)
+            .map(|e| e.path())
+            .find(|p| p.extension().is_some_and(|x| x == "app"))
+            .ok_or("更新包里没有 .app")?;
+        if let Err(e) = fs::rename(&app, target) {
+            // another volume: copy with ditto (keeps the code signature and attributes)
+            log(&format!("rename into place failed ({e}); copying with ditto"));
+            let ok = Command::new("ditto").arg(&app).arg(target).status().is_ok_and(|s| s.success());
+            if !ok {
+                remove_any(&staging);
+                return Err(format!("无法放到 {}", target.display()));
+            }
+        }
+        remove_any(&staging);
+    } else {
+        // AppImage: the file itself
+        fs::copy(installer, target).map_err(|e| format!("无法写入 {}：{e}", target.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(target, fs::Permissions::from_mode(0o755)).map_err(|e| e.to_string())?;
+        }
     }
+    Ok(())
+}
+
+/// Install, check the result, health-check the new version. Err = roll back.
+fn install_and_check(s: &mut UpdateState, target: &Path) -> Result<(), String> {
+    let installer = downloads_dir().join(installer_name(&s.to));
+    phase(s, "installing", &format!("安装 {}", installer_name(&s.to)));
+    install(&installer, target)?;
 
     phase(s, "verifying", "核对安装后的版本");
-    let got = installed_version(dir).unwrap_or_default();
+    let got = installed_version(target).unwrap_or_default();
     if got != s.to {
         return Err(format!("安装后版本是 \"{got}\"，应为 {}", s.to));
     }
@@ -515,7 +704,7 @@ fn install_and_check(s: &mut UpdateState, dir: &Path) -> Result<(), String> {
     phase(s, "health-check", "启动新版本，等待它报告正常");
     let marker = health_marker(&s.to);
     let _ = fs::remove_file(&marker);
-    let pid = launch(dir).map_err(|e| format!("无法启动新版本：{e}"))?;
+    let pid = launch(target).map_err(|e| format!("无法启动新版本：{e}"))?;
     let t = Instant::now();
     loop {
         if marker.exists() {
@@ -558,7 +747,7 @@ fn run_apply(args: &[String]) -> i32 {
     }
 
     // nothing changed yet: a bad package just means "not installed"
-    if let Err(why) = precheck(&s) {
+    if let Err(why) = precheck(&s, &dir) {
         s.result = Some("failed".into());
         phase(&mut s, "done", &format!("未安装 {to}：{why}"));
         relaunch(&dir, &s.message.clone());
