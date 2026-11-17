@@ -265,7 +265,15 @@ pub fn spawn_updater(args: &[String]) -> Result<(), String> {
     let dir = updates_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let updater = dir.join("plumb-updater.exe");
-    fs::copy(std::env::current_exe().map_err(|e| e.to_string())?, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    // A hard link (same file, second name; same volume: both under %LOCALAPPDATA%), not a
+    // copy. An unsigned app writing a copy of itself into AppData and running it is what
+    // Defender's ML flagged (Trojan:Win32/Bearfoos.B!ml) - then it quarantined Plumb.
+    let _ = fs::remove_file(&updater);
+    if let Err(e) = fs::hard_link(&exe, &updater) {
+        log(&format!("hard link failed ({e}); copying the updater instead"));
+        fs::copy(&exe, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
+    }
     let mut cmd = Command::new(&updater);
     cmd.arg("--updater").args(args).current_dir(&dir);
     #[cfg(windows)]
