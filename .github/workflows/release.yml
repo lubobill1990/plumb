@@ -1,9 +1,9 @@
 name: Release
 
 # Push a tag like v0.2.0 (matching "version" in src-tauri/tauri.conf.json) to publish a
-# GitHub Release: the Windows installer, its updater signature and latest.json.
+# GitHub Release for Windows, macOS and Linux, with updater signatures and one latest.json.
 #
-# Code signing (Authenticode) is done by SignPath (free for OSS, certificate by SignPath
+# Windows code signing (Authenticode) is done by SignPath (free for OSS, certificate by SignPath
 # Foundation) once the repo variable SIGNPATH_ORGANIZATION_ID is set; until then the
 # release is published unsigned. See docs/code-signing.md.
 #
@@ -15,8 +15,8 @@ name: Release
 #   4. bundle again from the signed exe: the patch rewrites identical bytes, so the
 #      embedded plumb.exe keeps its signature
 #   5. Authenticode-sign the installer (second approval)
-#   6. minisign-sign the final installer for the in-app updater, write latest.json
-#   7. publish
+#   6. (publish job) minisign-sign every final package for the in-app updater, write
+#      latest.json, publish. macOS / Linux jobs: see below.
 on:
   push:
     tags: ["v*"]
@@ -40,7 +40,7 @@ env:
   BUNDLE_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
 
 jobs:
-  release:
+  windows:
     runs-on: windows-latest
     # two manual SignPath approvals may sit in the queue for a while
     timeout-minutes: 360
@@ -169,28 +169,221 @@ jobs:
           "installer signature: $($s.Status) $($s.SignerCertificate.Subject)"
           if ($env:SIGN -eq 'true' -and $s.Status -ne 'Valid') { throw "installer not validly signed" }
 
-      # ---- in-app updater: minisign signature of the FINAL installer + latest.json ----
-      - name: Updater signature + latest.json
+      - name: Keep the Windows files for the publish job
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows
+          path: dist-release/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # macOS: one universal .app (Apple Silicon + Intel), signed with the Developer ID of
+  # Suzhou Zhishi Miaoyan Software Technology Co., Ltd when the APPLE_* secrets are set
+  # (scripts: D:\certs\set-plumb-apple-secrets.sh). Notarization runs separately with a
+  # 20-minute limit (Apple's queue has stalled for hours on this account): accepted ->
+  # stapled; timed out -> shipped signed but not notarized ("Open Anyway").
+  # ---------------------------------------------------------------------------
+  macos:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      HAS_APPLE: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12 != '' }}
+      HAS_NOTARY: ${{ secrets.APPLE_NOTARY_API_KEY_P8 != '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || env.TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Version must match the tag
+        id: v
+        run: |
+          v=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match version $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build + sign (Developer ID)
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12 }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: "${{ secrets.APPLE_DEVELOPER_ID_APP_P12 != '' && (vars.APPLE_SIGNING_IDENTITY || 'Developer ID Application: Suzhou Zhishi Miaoyan Software Technology Co., Ltd (QTKH7M6UMC)') || '' }}"
+        run: npx tauri build --ci --target universal-apple-darwin --bundles app,dmg --config "$BUNDLE_CONFIG"
+
+      - name: Notarize (20 min limit) + staple
+        if: env.HAS_APPLE == 'true' && env.HAS_NOTARY == 'true'
+        env:
+          P8: ${{ secrets.APPLE_NOTARY_API_KEY_P8 }}
+          KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          ISSUER: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+        run: |
+          b=src-tauri/target/universal-apple-darwin/release/bundle
+          dmg=$(ls $b/dmg/*.dmg)
+          printf '%s' "$P8" > "$RUNNER_TEMP/notary.p8"
+          if xcrun notarytool submit "$dmg" --key "$RUNNER_TEMP/notary.p8" --key-id "$KEY_ID" --issuer "$ISSUER" \
+               --wait --timeout 20m --output-format json | tee "$RUNNER_TEMP/notary.json" | grep -q '"status" *: *"Accepted"'; then
+            xcrun stapler staple "$dmg"
+            xcrun stapler staple "$b/macos/Plumb.app"
+            echo "NOTARIZED=true" >> "$GITHUB_ENV"
+          else
+            echo "::warning::notarization did not finish in 20 minutes (or was rejected); shipping signed but not notarized"
+            cat "$RUNNER_TEMP/notary.json" || true
+          fi
+          rm -f "$RUNNER_TEMP/notary.p8"
+
+      - name: Check the signature
+        if: env.HAS_APPLE == 'true'
+        run: |
+          app=src-tauri/target/universal-apple-darwin/release/bundle/macos/Plumb.app
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E 'Authority|TeamIdentifier'
+          spctl -a -vv "$app" || echo "(Gatekeeper: not notarized yet)"
+
+      - name: Collect the macOS files
+        run: |
+          v=${{ steps.v.outputs.version }}
+          b=src-tauri/target/universal-apple-darwin/release/bundle
+          mkdir -p dist-release
+          cp "$(ls $b/dmg/*.dmg)" "dist-release/Plumb_${v}_universal.dmg"
+          # the in-app updater's package: the (stapled) .app
+          tar -czf "dist-release/Plumb_${v}_universal.app.tar.gz" -C "$b/macos" Plumb.app
+          echo "macos-signed=$HAS_APPLE notarized=${NOTARIZED:-false}" > dist-release/macos-status.txt
+          ls -la dist-release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-macos
+          path: dist-release/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Linux: AppImage (self-updating) + deb (updated through the package manager)
+  # ---------------------------------------------------------------------------
+  linux:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || env.TAG }}
+
+      - name: System libraries (webkit2gtk, gtk)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Version must match the tag
+        id: v
+        run: |
+          v=$(node -p "require('./src-tauri/tauri.conf.json').version")
+          [ "v$v" = "$TAG" ] || { echo "tag $TAG does not match version $v"; exit 1; }
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        run: npx tauri build --ci --bundles appimage,deb --config "$BUNDLE_CONFIG"
+
+      - name: Collect the Linux files
+        run: |
+          v=${{ steps.v.outputs.version }}
+          b=src-tauri/target/release/bundle
+          mkdir -p dist-release
+          cp "$(ls $b/appimage/*.AppImage)" "dist-release/Plumb_${v}_amd64.AppImage"
+          cp "$(ls $b/deb/*.deb)" "dist-release/Plumb_${v}_amd64.deb"
+          ls -la dist-release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux
+          path: dist-release/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Updater signatures (minisign, made last: Authenticode / notarization change bytes),
+  # one latest.json for every platform, publish.
+  # ---------------------------------------------------------------------------
+  publish:
+    needs: [windows, macos, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.dry_run && github.sha || env.TAG }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist-release
+          merge-multiple: true
+
+      - name: Updater signatures + latest.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
-          $installer = "dist-release/${{ steps.v.outputs.installer }}"
-          npx tauri signer sign $installer
-          if (-not (Test-Path "$installer.sig")) { throw "no updater signature" }
-          $manifest = [ordered]@{
-            version  = "${{ steps.v.outputs.version }}"
-            notes    = "Plumb $env:TAG"
-            pub_date = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-            platforms = [ordered]@{
-              "windows-x86_64" = [ordered]@{
-                signature = (Get-Content "$installer.sig" -Raw).Trim()
-                url = "https://github.com/${{ github.repository }}/releases/download/$env:TAG/${{ steps.v.outputs.installer }}"
-              }
-            }
-          }
-          $manifest | ConvertTo-Json -Depth 5 | Set-Content dist-release/latest.json -Encoding utf8NoBOM
-          Get-Content dist-release/latest.json
+          cd dist-release
+          v=${TAG#v}
+          win="Plumb_${v}_x64-setup.exe"
+          mac="Plumb_${v}_universal.app.tar.gz"
+          lin="Plumb_${v}_amd64.AppImage"
+          for f in "$win" "$mac" "$lin"; do
+            [ -f "$f" ] || { echo "missing $f"; exit 1; }
+            npx tauri signer sign "$f"
+            [ -f "$f.sig" ] || { echo "no updater signature for $f"; exit 1; }
+          done
+          url="https://github.com/${{ github.repository }}/releases/download/$TAG"
+          WIN="$win" MAC="$mac" LIN="$lin" URL="$url" V="$v" node -e '
+            const fs = require("fs");
+            const e = process.env;
+            const entry = (f) => ({ signature: fs.readFileSync(f + ".sig", "utf8").trim(), url: e.URL + "/" + f });
+            const manifest = {
+              version: e.V,
+              notes: "Plumb v" + e.V,
+              pub_date: new Date().toISOString().replace(/\.\d+Z$/, "Z"),
+              platforms: {
+                "windows-x86_64": entry(e.WIN),
+                "darwin-aarch64": entry(e.MAC),
+                "darwin-x86_64": entry(e.MAC),
+                "linux-x86_64": entry(e.LIN),
+              },
+            };
+            fs.writeFileSync("latest.json", JSON.stringify(manifest, null, 2) + "\n");
+          '
+          cat latest.json
+          ls -la
 
       - name: Dry run - keep the files as an artifact
         if: inputs.dry_run
@@ -204,12 +397,18 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $signed = if ($env:SIGN -eq 'true') { 'The installer and plumb.exe are code-signed (certificate by SignPath Foundation).' } else { 'The installer is not code-signed yet, so Windows SmartScreen may warn on first launch: "More info" -> "Run anyway".' }
-          $notes = "Windows installer (NSIS, per-user). $signed`n`nInstalled copies (0.1.2+) offer this update in the title bar."
-          $files = Get-ChildItem dist-release | ForEach-Object FullName
-          gh release view $env:TAG *> $null
-          if ($LASTEXITCODE -eq 0) {
-            gh release upload $env:TAG @files --clobber
-          } else {
-            gh release create $env:TAG @files --title "Plumb $env:TAG" --notes $notes --verify-tag
-          }
+          cd dist-release
+          mac_status=$(cat macos-status.txt); rm -f macos-status.txt
+          win_note='Windows: NSIS per-user installer'
+          [ "$SIGN" = "true" ] && win_note="$win_note, code-signed (certificate by SignPath Foundation)" || win_note="$win_note, not code-signed yet (SmartScreen: More info -> Run anyway)"
+          case "$mac_status" in
+            *macos-signed=true*notarized=true*) mac_note='macOS: universal dmg, signed (Developer ID: Suzhou Zhishi Miaoyan Software Technology Co., Ltd) and notarized' ;;
+            *macos-signed=true*) mac_note='macOS: universal dmg, signed (Developer ID: Suzhou Zhishi Miaoyan Software Technology Co., Ltd), notarization pending: first launch via System Settings > Privacy & Security > Open Anyway' ;;
+            *) mac_note='macOS: universal dmg, not signed yet: run xattr -cr /Applications/Plumb.app once after copying it' ;;
+          esac
+          notes=$(printf '%s\n\n- %s\n- %s\n- Linux: AppImage (updates itself) and deb\n\nInstalled copies offer this update in the title bar.' "Plumb $TAG" "$win_note" "$mac_note")
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ./* --clobber
+          else
+            gh release create "$TAG" ./* --title "Plumb $TAG" --notes "$notes" --verify-tag
+          fi

@@ -46,8 +46,16 @@ app built on [xterm.js](https://xtermjs.org) that fixes the causes instead of hi
 
 ## Install
 
-Download the installer from [Releases](../../releases). The app is not code-signed yet,
-so Windows SmartScreen may warn on first launch ("More info" → "Run anyway").
+From [Releases](../../releases):
+
+| OS | File | Notes |
+|---|---|---|
+| Windows 10/11 | `Plumb_<version>_x64-setup.exe` | Per-user install, no admin needed. Not code-signed yet: SmartScreen may warn ("More info" → "Run anyway"). |
+| macOS 11+ (Apple Silicon and Intel) | `Plumb_<version>_universal.dmg` | Drag Plumb to Applications. Signed with the Developer ID of Suzhou Zhishi Miaoyan Software Technology Co., Ltd; if a release notes "notarization pending", open it the first time via System Settings → Privacy & Security → Open Anyway. |
+| Linux x86_64 | `Plumb_<version>_amd64.AppImage` or `.deb` | AppImage: `chmod +x` and run; it updates itself. deb: `sudo apt install ./Plumb_*.deb`; update through your package manager. |
+
+The macOS and Linux builds use your login shell (zsh / bash / fish) and agent CLIs on its
+`PATH`; shortcuts use ⌘ on macOS instead of Ctrl+Shift.
 
 ## Build from source
 
