@@ -497,6 +497,26 @@ fn update_open_log() -> Result<(), String> {
     std::process::Command::new("notepad.exe").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
+/// Running inside a Remote Desktop session (RDP, Windows 365 / Cloud PC, ...). There the
+/// GPU device behind WebGL can be swapped on reconnect / unlock without a context-loss
+/// event, leaving xterm's glyph textures garbled; the app then prefers the DOM renderer.
+#[tauri::command]
+fn is_remote_session() -> bool {
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        extern "system" {
+            fn GetSystemMetrics(index: i32) -> i32;
+        }
+        const SM_REMOTESESSION: i32 = 0x1000;
+        unsafe { GetSystemMetrics(SM_REMOTESESSION) != 0 }
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 /// Adopt a detached session: replays snapshot + buffered output, then streams live.
 #[tauri::command]
 fn pty_attach(window: Window, state: State<'_, PtyState>, id: u32, on_event: Channel<PtyEvent>) -> Result<(), String> {
@@ -676,6 +696,7 @@ pub fn run() {
             window_drag,
             write_text_file,
             session_count,
+            is_remote_session,
             update_check,
             update_download,
             update_apply,
