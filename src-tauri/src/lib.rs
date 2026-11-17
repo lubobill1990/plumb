@@ -76,11 +76,15 @@ struct Profile {
     command: Option<String>,
     program: String,
     args: Vec<String>,
+    /// Extra environment for the process (shell integration on macOS / Linux).
+    env: Vec<(String, String)>,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct Platform {
+    /// "windows" | "macos" | "linux"
+    os: String,
     windows_build: Option<u32>,
     profiles: Vec<Profile>,
     home: Option<String>,
@@ -199,45 +203,199 @@ fn windows_build() -> Option<u32> {
     None
 }
 
-#[tauri::command]
-fn platform_info() -> Platform {
-    let mut profiles = Vec::new();
-    let shell = find_in_path("pwsh.exe")
-        .or_else(|| find_in_path("powershell.exe"))
-        .map(|p| p.to_string_lossy().into_owned());
-    let profile = |id: &str, name: &str, kind: &str, command: Option<&str>, program: &str, args: Vec<String>| Profile {
+fn os_name() -> &'static str {
+    if cfg!(windows) {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "linux"
+    }
+}
+
+fn profile(id: &str, name: &str, kind: &str, command: Option<&str>, program: &str, args: Vec<String>, env: Vec<(String, String)>) -> Profile {
+    Profile {
         id: id.into(),
         name: name.into(),
         kind: kind.into(),
         command: command.map(Into::into),
         program: program.into(),
         args,
-    };
+        env,
+    }
+}
 
+fn windows_profiles() -> Vec<Profile> {
+    let mut profiles = Vec::new();
+    let shell = find_in_path("pwsh.exe")
+        .or_else(|| find_in_path("powershell.exe"))
+        .map(|p| p.to_string_lossy().into_owned());
     if let Some(shell) = &shell {
-        profiles.push(profile("pwsh", "PowerShell", "shell", None, shell, pwsh_args(None)));
+        profiles.push(profile("pwsh", "PowerShell", "shell", None, shell, pwsh_args(None), vec![]));
     }
-    if cfg!(windows) {
-        // $e]9;9;$P$e\ = report cwd (OSC 9;9), then the normal "C:\x>" prompt
-        let args = vec!["/k".into(), r"prompt $e]9;9;$P$e\$P$G".into()];
-        profiles.push(profile("cmd", "CMD", "shell", None, "cmd.exe", args));
-    } else {
-        let sh = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
-        profiles.push(profile("shell", "Shell", "shell", None, &sh, vec!["-l".into()]));
-    }
-
+    // $e]9;9;$P$e\ = report cwd (OSC 9;9), then the normal "C:\x>" prompt
+    let args = vec!["/k".into(), r"prompt $e]9;9;$P$e\$P$G".into()];
+    profiles.push(profile("cmd", "CMD", "shell", None, "cmd.exe", args, vec![]));
     for (cmd, name) in AGENTS {
         if find_command(cmd).is_none() {
             continue;
         }
         // Run the agent inside the shell, so you land back in the shell (same dir) on exit.
         match &shell {
-            Some(shell) => profiles.push(profile(cmd, name, "agent", Some(cmd), shell, pwsh_args(Some(cmd)))),
-            None => profiles.push(profile(cmd, name, "agent", Some(cmd), cmd, vec![])),
+            Some(shell) => profiles.push(profile(cmd, name, "agent", Some(cmd), shell, pwsh_args(Some(cmd)), vec![])),
+            None => profiles.push(profile(cmd, name, "agent", Some(cmd), cmd, vec![], vec![])),
         }
     }
+    profiles
+}
 
+// ---------------------------------------------------------------------------
+// macOS / Linux shells. Like VS Code and WezTerm, a small shell integration reports
+// the current directory with OSC 7 (tabs show it, new tabs open there) after loading
+// the user's own startup files unchanged.
+// ---------------------------------------------------------------------------
+
+/// zsh: ZDOTDIR points at these files, each loads the user's own counterpart; .zshrc
+/// then adds the hook and hands ZDOTDIR back, so .zlogin and child shells are untouched.
+const ZSH_ENV: &str = r#"# Plumb shell integration (generated; safe to delete)
+__plumb_zd="$ZDOTDIR"; ZDOTDIR="${PLUMB_USER_ZDOTDIR:-$HOME}"
+[ -f "$ZDOTDIR/.zshenv" ] && . "$ZDOTDIR/.zshenv"
+PLUMB_USER_ZDOTDIR="$ZDOTDIR"; ZDOTDIR="$__plumb_zd"; unset __plumb_zd
+"#;
+const ZSH_PROFILE: &str = r#"# Plumb shell integration (generated; safe to delete)
+[ -f "$PLUMB_USER_ZDOTDIR/.zprofile" ] && { __plumb_zd="$ZDOTDIR"; ZDOTDIR="$PLUMB_USER_ZDOTDIR"; . "$ZDOTDIR/.zprofile"; ZDOTDIR="$__plumb_zd"; unset __plumb_zd; }
+"#;
+const ZSH_RC: &str = r#"# Plumb shell integration (generated; safe to delete)
+ZDOTDIR="$PLUMB_USER_ZDOTDIR"
+[ -f "$ZDOTDIR/.zshrc" ] && . "$ZDOTDIR/.zshrc"
+__plumb_osc7() { printf '\e]7;file://%s%s\a' "${HOST}" "${PWD// /%20}"; }
+autoload -Uz add-zsh-hook && add-zsh-hook precmd __plumb_osc7 && add-zsh-hook chpwd __plumb_osc7
+unset PLUMB_USER_ZDOTDIR
+"#;
+/// bash: used as --rcfile; loads the user's login files (as a login shell would), then
+/// ~/.bashrc if none of them exists, then adds the hook to PROMPT_COMMAND.
+const BASH_RC: &str = r#"# Plumb shell integration (generated; safe to delete)
+[ -f /etc/profile ] && . /etc/profile
+if [ -f ~/.bash_profile ]; then . ~/.bash_profile
+elif [ -f ~/.bash_login ]; then . ~/.bash_login
+elif [ -f ~/.profile ]; then . ~/.profile
+elif [ -f ~/.bashrc ]; then . ~/.bashrc
+fi
+__plumb_osc7() { printf '\e]7;file://%s%s\a' "${HOSTNAME}" "${PWD// /%20}"; }
+PROMPT_COMMAND="__plumb_osc7${PROMPT_COMMAND:+;$PROMPT_COMMAND}"
+"#;
+
+/// Write the integration files under the app's data dir; None if that fails.
+fn shell_integration_dir(app: &AppHandle) -> Option<PathBuf> {
+    let dir = app.path().app_local_data_dir().ok()?.join("shell-integration");
+    std::fs::create_dir_all(dir.join("zsh")).ok()?;
+    for (name, body) in [("zsh/.zshenv", ZSH_ENV), ("zsh/.zprofile", ZSH_PROFILE), ("zsh/.zshrc", ZSH_RC), ("bash.rc", BASH_RC)] {
+        std::fs::write(dir.join(name), body).ok()?;
+    }
+    Some(dir)
+}
+
+/// How to start `shell` (path) interactively, optionally running `command` first and then
+/// staying in the shell: (args, env).
+fn unix_shell_launch(shell: &str, integration: Option<&std::path::Path>, command: Option<&str>) -> (Vec<String>, Vec<(String, String)>) {
+    let base = std::path::Path::new(shell).file_name().and_then(|n| n.to_str()).unwrap_or("sh");
+    let mut env = Vec::new();
+    let mut args: Vec<String> = match (base, integration) {
+        ("zsh", Some(dir)) => {
+            let user = std::env::var("ZDOTDIR").ok().or_else(home_dir).unwrap_or_default();
+            env.push(("PLUMB_USER_ZDOTDIR".into(), user));
+            env.push(("ZDOTDIR".into(), dir.join("zsh").to_string_lossy().into_owned()));
+            vec!["-l".into()]
+        }
+        ("bash", Some(dir)) => vec!["--rcfile".into(), dir.join("bash.rc").to_string_lossy().into_owned()],
+        _ => vec!["-l".into()],
+    };
+    args.push("-i".into());
+    if let Some(cmd) = command {
+        // run the agent, then replace it with the shell itself (back to a prompt, same dir)
+        let quote = |s: &str| format!("'{}'", s.replace('\'', r"'\''"));
+        let again = std::iter::once(shell).chain(args.iter().map(String::as_str)).map(quote).collect::<Vec<_>>().join(" ");
+        args.push("-c".into());
+        args.push(format!("{cmd}; exec {again}"));
+    }
+    (args, env)
+}
+
+fn unix_profiles(app: &AppHandle) -> Vec<Profile> {
+    let integration = shell_integration_dir(app);
+    let login = std::env::var("SHELL").ok().filter(|s| std::path::Path::new(s).is_file());
+    let mut shells: Vec<String> = login.clone().into_iter().collect();
+    for name in ["zsh", "bash", "fish"] {
+        if let Some(p) = find_in_path(name) {
+            let p = p.to_string_lossy().into_owned();
+            let base = |s: &str| std::path::Path::new(s).file_name().map(|n| n.to_owned());
+            if !shells.iter().any(|s| base(s) == base(&p)) {
+                shells.push(p);
+            }
+        }
+    }
+    if shells.is_empty() {
+        shells.push("/bin/sh".into());
+    }
+    let mut profiles = Vec::new();
+    for sh in &shells {
+        let name = std::path::Path::new(sh).file_name().and_then(|n| n.to_str()).unwrap_or("sh").to_string();
+        let (args, env) = unix_shell_launch(sh, integration.as_deref(), None);
+        profiles.push(profile(&format!("sh-{name}"), &name, "shell", None, sh, args, env));
+    }
+    // agents run inside the login shell: its PATH (Homebrew, npm, ...) and back to a prompt on exit
+    let agent_shell = shells[0].clone();
+    for (cmd, name) in AGENTS {
+        if find_command(cmd).is_none() {
+            continue;
+        }
+        let (args, env) = unix_shell_launch(&agent_shell, integration.as_deref(), Some(cmd));
+        profiles.push(profile(cmd, name, "agent", Some(cmd), &agent_shell, args, env));
+    }
+    profiles
+}
+
+/// Apps started from Finder / a desktop launcher get a minimal PATH (no Homebrew, no
+/// npm globals), so agent CLIs would not be found. Take PATH from the login shell once.
+#[cfg(unix)]
+fn adopt_login_shell_path() {
+    use std::process::{Command, Stdio};
+    let Ok(shell) = std::env::var("SHELL") else { return };
+    let Ok(mut child) = Command::new(&shell)
+        .args(["-l", "-i", "-c", "printf '__PLUMB_PATH__%s__PLUMB_PATH__' \"$PATH\""])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return;
+    };
+    // an rc file that waits for input (or auto-starts tmux) must not hang the app
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if start.elapsed() < std::time::Duration::from_secs(3) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                return;
+            }
+        }
+    }
+    let mut out = String::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_string(&mut out);
+    }
+    if let Some(path) = out.split("__PLUMB_PATH__").nth(1).filter(|p| !p.is_empty()) {
+        std::env::set_var("PATH", path);
+    }
+}
+
+#[tauri::command]
+fn platform_info(app: AppHandle) -> Platform {
+    let profiles = if cfg!(windows) { windows_profiles() } else { unix_profiles(&app) };
     Platform {
+        os: os_name().into(),
         windows_build: windows_build(),
         profiles,
         home: home_dir(),
@@ -258,6 +416,7 @@ fn pty_spawn(
     program: String,
     args: Vec<String>,
     cwd: Option<String>,
+    env: Option<Vec<(String, String)>>,
     cols: u16,
     rows: u16,
     on_event: Channel<PtyEvent>,
@@ -285,7 +444,11 @@ fn pty_spawn(
     cmd.env_remove("NO_COLOR");
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
-    cmd.env("TERM_PROGRAM", "xterm-tauri");
+    cmd.env("TERM_PROGRAM", "Plumb");
+    cmd.env("TERM_PROGRAM_VERSION", update::current_version());
+    for (k, v) in env.unwrap_or_default() {
+        cmd.env(k, v);
+    }
 
     let mut child = pair.slave.spawn_command(cmd).map_err(|e| format!("启动 {program} 失败: {e}"))?;
     drop(pair.slave);
@@ -494,7 +657,12 @@ fn update_open_log() -> Result<(), String> {
     if !path.exists() {
         return Err("还没有更新日志".into());
     }
-    std::process::Command::new("notepad.exe").arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
+    let opener = if cfg!(windows) { "notepad.exe" } else if cfg!(target_os = "macos") { "open" } else { "xdg-open" };
+    let mut cmd = std::process::Command::new(opener);
+    if cfg!(target_os = "macos") {
+        cmd.arg("-t"); // TextEdit
+    }
+    cmd.arg(path).spawn().map(|_| ()).map_err(|e| e.to_string())
 }
 
 /// Running inside a Remote Desktop session (RDP, Windows 365 / Cloud PC, ...). There the
@@ -543,8 +711,16 @@ async fn open_window(app: AppHandle, state: State<'_, PtyState>, attach: Option<
         .title("Plumb")
         .inner_size(width, height)
         .min_inner_size(400.0, 240.0)
-        .decorations(false)
         .initialization_script(format!("window.__ATTACH__ = {};", attach.map_or("null".into(), |id| id.to_string())));
+    // macOS: native traffic lights over our own title bar; elsewhere: our own buttons
+    #[cfg(target_os = "macos")]
+    {
+        b = b.title_bar_style(tauri::TitleBarStyle::Overlay).hidden_title(true);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        b = b.decorations(false);
+    }
     if let Ok(p) = app.cursor_position() {
         let scale = app
             .monitor_from_point(p.x, p.y)
@@ -648,6 +824,8 @@ fn window_drag(app: AppHandle, window: Window, state: State<'_, PtyState>, phase
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(unix)]
+    adopt_login_shell_path();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())

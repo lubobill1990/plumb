@@ -15,6 +15,7 @@ import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialo
 import "@xterm/xterm/css/xterm.css";
 import "./style.css";
 import { AGENT_ICONS } from "./icons";
+import { glyph as glyphEl, svgIcon } from "./glyphs";
 import { initUpdater, checkForUpdate, installUpdate, onUpdateStatus, currentVersion, rollback, rollbackVersion, openUpdateLog, autoCheckEnabled, setAutoCheck, type UpdateStatus } from "./updater";
 import pwshIcon from "./assets/pwsh.png";
 import cmdIcon from "./assets/cmd.png";
@@ -26,8 +27,11 @@ interface Profile {
   command: string | null;
   program: string;
   args: string[];
+  /** Extra environment (shell integration on macOS / Linux). */
+  env?: [string, string][];
 }
 interface Platform {
+  os: "windows" | "macos" | "linux";
   windowsBuild: number | null;
   profiles: Profile[];
   home: string | null;
@@ -71,6 +75,14 @@ const appWindow = getCurrentWindow();
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 let platform: Platform;
+
+function isMac() {
+  return platform?.os === "macos";
+}
+/** How an app shortcut is written on this OS: ⌘T on macOS, Ctrl+Shift+T elsewhere. */
+function shortcut(letter: string) {
+  return isMac() ? `⌘${letter.toUpperCase()}` : `Ctrl+Shift+${letter.toUpperCase()}`;
+}
 const tabs: Tab[] = [];
 let active: Tab | null = null;
 
@@ -102,7 +114,7 @@ class Tab {
 
     this.tabBtn = document.createElement("div");
     this.tabBtn.className = "tab";
-    this.tabBtn.innerHTML = `<span class="ticon"></span><span class="title"></span><span class="dir"></span><span class="close" title="关闭 (Ctrl+Shift+W)">✕</span>`;
+    this.tabBtn.innerHTML = `<span class="ticon"></span><span class="title"></span><span class="dir"></span><span class="close" title="关闭 (${shortcut("W")})">✕</span>`;
     this.tabBtn.onpointerdown = (e) => {
       if (e.button !== 0) return;
       if ((e.target as HTMLElement).classList.contains("close")) return;
@@ -122,8 +134,13 @@ class Tab {
     this.showIcon();
 
     this.term = new Terminal({
-      fontFamily: '"Cascadia Mono", "Cascadia Code", Consolas, "Sarasa Mono SC", "Microsoft YaHei UI", monospace',
+      fontFamily:
+        '"Cascadia Mono", "Cascadia Code", Consolas, "SF Mono", Menlo, "DejaVu Sans Mono", "Ubuntu Mono", "Sarasa Mono SC", "Microsoft YaHei UI", "PingFang SC", "Noto Sans Mono CJK SC", monospace',
       fontSize,
+      // macOS: Option sends Meta (Alt+Enter, Alt+arrows in agent CLIs); Option+drag selects
+      // text even when the app has turned on mouse reporting (Claude Code does)
+      macOptionIsMeta: platform.os === "macos",
+      macOptionClickForcesSelection: platform.os === "macos",
       cursorBlink: true,
       scrollback: 10000,
       allowProposedApi: true,
@@ -326,6 +343,7 @@ ${this.cwd}` : this.title;
       this.id = await invoke<number>("pty_spawn", {
         program: this.profile.program,
         args: this.profile.args,
+        env: this.profile.env ?? [],
         cwd: this.cwd ?? platform.home,
         cols: this.term.cols,
         rows: this.term.rows,
@@ -375,12 +393,14 @@ ${this.cwd}` : this.title;
   }
 
   onKey(e: KeyboardEvent): boolean {
-    const ctrl = e.ctrlKey && !e.altKey && !e.metaKey;
+    const mac = isMac();
+    // the "command" modifier: Cmd on macOS (Ctrl stays with the terminal), Ctrl elsewhere
+    const ctrl = mac ? e.metaKey && !e.ctrlKey && !e.altKey : e.ctrlKey && !e.altKey && !e.metaKey;
     const key = e.key.toLowerCase();
     const down = e.type === "keydown";
 
-    // Ctrl+Shift+C, or Ctrl+C with a selection: copy
-    if (ctrl && key === "c" && (e.shiftKey || this.term.hasSelection())) {
+    // copy: Cmd+C on macOS; Ctrl+Shift+C, or Ctrl+C with a selection, elsewhere
+    if (ctrl && key === "c" && (mac || e.shiftKey || this.term.hasSelection())) {
       if (down) {
         void navigator.clipboard.writeText(this.term.getSelection());
         this.term.clearSelection();
@@ -403,7 +423,8 @@ ${this.cwd}` : this.title;
       e.preventDefault();
       return false;
     }
-    if (ctrl && e.shiftKey) {
+    // app shortcuts: Cmd+key on macOS, Ctrl+Shift+key elsewhere (see shortcut())
+    if (ctrl && e.shiftKey !== mac) {
       const actions: Record<string, () => void> = {
         r: () => this.repaint(),
         t: () => void newTab(),
@@ -677,13 +698,17 @@ function showDropHint(title: string | null) {
 // ---------------------------------------------------------------------------
 // window chrome
 // ---------------------------------------------------------------------------
+$<HTMLButtonElement>("#new-tab").innerHTML = svgIcon("\uE710", 14);
+$<HTMLButtonElement>("#launch-menu").innerHTML = svgIcon("\uE70D", 12);
+$<HTMLButtonElement>("#win-min").innerHTML = svgIcon("\uE921", 12);
+$<HTMLButtonElement>("#win-close").innerHTML = svgIcon("\uE8BB", 12);
 const maxBtn = $<HTMLButtonElement>("#win-max");
 $<HTMLButtonElement>("#win-min").onclick = () => void appWindow.minimize();
 maxBtn.onclick = () => void appWindow.toggleMaximize();
 $<HTMLButtonElement>("#win-close").onclick = () => void appWindow.close();
 const syncMaxIcon = async () => {
   const max = await appWindow.isMaximized();
-  maxBtn.innerHTML = max ? "&#xE923;" : "&#xE922;";
+  maxBtn.innerHTML = svgIcon(max ? "\uE923" : "\uE922", 12);
   maxBtn.title = max ? "还原" : "最大化";
 };
 void appWindow.onResized(() => void syncMaxIcon());
@@ -710,7 +735,8 @@ window.addEventListener("keydown", (e) => {
   // already run (and called preventDefault) before the event bubbles up here — skip it,
   // or Ctrl+Shift+T opens two tabs.
   if (e.defaultPrevented) return;
-  if (e.ctrlKey && e.shiftKey && e.key.toLowerCase() === "t") { e.preventDefault(); void newTab(); }
+  const newTabCombo = isMac() ? e.metaKey && !e.shiftKey && !e.ctrlKey : e.ctrlKey && e.shiftKey;
+  if (newTabCombo && e.key.toLowerCase() === "t") { e.preventDefault(); void newTab(); }
 });
 
 // No WebView context menu (Back / Reload / Inspect ...) anywhere; text fields keep theirs.
@@ -732,7 +758,7 @@ function setFontSize(size: number) {
   }
 }
 termsEl.addEventListener("wheel", (e) => {
-  if (!e.ctrlKey) return;
+  if (!e.ctrlKey && !e.metaKey) return;
   e.preventDefault();
   e.stopPropagation(); // don't let xterm scroll the buffer
   setFontSize(fontSize + (e.deltaY < 0 ? 1 : -1));
@@ -823,7 +849,7 @@ document.body.appendChild(tabMenu);
 
 function menuItem(glyph: string, label: string, run: () => void, opts: { hint?: string; disabled?: boolean } = {}) {
   const row = el("div", "menu-item" + (opts.disabled ? " disabled" : ""));
-  row.append(el("span", "glyph", glyph), el("span", "grow", label));
+  row.append(glyphEl(glyph), el("span", "grow", label));
   if (opts.hint) row.append(el("span", "hint", opts.hint));
   if (!opts.disabled) row.onclick = () => { closeTabMenu(); run(); };
   return row;
@@ -841,23 +867,23 @@ function openTabMenu(tab: Tab, x: number, y: number) {
     swatches.append(s);
   }
   const colorRow = el("div", "menu-item static");
-  colorRow.append(el("span", "glyph", "\uE790"), swatches);
+  colorRow.append(glyphEl("\uE790"), swatches);
 
   tabMenu.replaceChildren(
     colorRow,
     menuItem("\uE8AC", "重命名标签", () => renameTab(tab)),
-    menuItem("\uE8C8", "复制标签", () => void duplicateTab(tab), { hint: "Ctrl+Shift+D" }),
+    menuItem("\uE8C8", "复制标签", () => void duplicateTab(tab), { hint: shortcut("D") }),
     el("div", "menu-sep"),
     menuItem("\uE8A7", "移到新窗口", () => void moveToNewWindow(tab), { disabled: tabs.length < 2 }),
     menuItem("\uE76B", "左移", () => moveTab(tab, -1), { disabled: i <= 0 }),
     menuItem("\uE76C", "右移", () => moveTab(tab, 1), { disabled: i >= tabs.length - 1 }),
     el("div", "menu-sep"),
     menuItem("\uE74E", "导出文本…", () => void exportText(tab)),
-    menuItem("\uE721", "查找", () => { activate(tab); openFind(); }, { hint: "Ctrl+Shift+F" }),
+    menuItem("\uE721", "查找", () => { activate(tab); openFind(); }, { hint: shortcut("F") }),
     el("div", "menu-sep"),
     menuItem("", "关闭其他标签", () => closeTabs(tabs.filter((t) => t !== tab)), { disabled: tabs.length < 2 }),
     menuItem("", "关闭右侧标签", () => closeTabs(tabs.slice(i + 1)), { disabled: i >= tabs.length - 1 }),
-    menuItem("\uE711", "关闭标签", () => tab.close(), { hint: "Ctrl+Shift+W" }),
+    menuItem("\uE711", "关闭标签", () => tab.close(), { hint: shortcut("W") }),
   );
   tabMenu.hidden = false;
   tabMenu.style.left = `${Math.max(4, Math.min(x, innerWidth - tabMenu.offsetWidth - 4))}px`;
@@ -952,11 +978,11 @@ const findBar = Object.assign(document.createElement("div"), { id: "find-bar", h
 findBar.innerHTML = `
   <input class="find-input" placeholder="查找" spellcheck="false" />
   <span class="find-count"></span>
-  <button class="find-btn" data-act="prev" title="上一个 (Shift+Enter)">&#xE70E;</button>
-  <button class="find-btn" data-act="next" title="下一个 (Enter)">&#xE70D;</button>
+  <button class="find-btn" data-act="prev" title="上一个 (Shift+Enter)">${svgIcon("\uE70E")}</button>
+  <button class="find-btn" data-act="next" title="下一个 (Enter)">${svgIcon("\uE70D")}</button>
   <button class="find-btn toggle" data-act="case" title="区分大小写">Aa</button>
   <button class="find-btn toggle" data-act="regex" title="正则表达式">.*</button>
-  <button class="find-btn" data-act="close" title="关闭 (Esc)">&#xE8BB;</button>`;
+  <button class="find-btn" data-act="close" title="关闭 (Esc)">${svgIcon("\uE8BB")}</button>`;
 termsEl.appendChild(findBar);
 const findInput = findBar.querySelector<HTMLInputElement>(".find-input")!;
 const findCount = findBar.querySelector<HTMLElement>(".find-count")!;
@@ -1155,7 +1181,7 @@ function renderLauncher() {
   const foot = el("div", "menu-item update-row");
   const ver = el("span", "grow version", "Plumb");
   const action = el("span", "update-action", "");
-  foot.append(el("span", "glyph", "\uE895"), ver, action);
+  foot.append(glyphEl("\uE895"), ver, action);
   void currentVersion.then((v) => (ver.textContent = `Plumb ${v}`));
   const show = (s: UpdateStatus) => {
     const text: Record<UpdateStatus["kind"], string> = {
@@ -1182,7 +1208,7 @@ function renderLauncher() {
   const rb = rollbackVersion();
   if (rb) {
     const row = el("div", "menu-item");
-    row.append(el("span", "glyph", String.fromCodePoint(0xe7a7)), el("span", "grow", `回滚到 ${rb}`));
+    row.append(glyphEl(String.fromCodePoint(0xe7a7)), el("span", "grow", `回滚到 ${rb}`));
     row.title = "恢复上次更新前备份的版本";
     row.onclick = () => { launcher.hidden = true; void rollback(); };
     launcher.append(row);
@@ -1191,7 +1217,7 @@ function renderLauncher() {
   const autoLabel = el("span", "grow", "");
   const renderAuto = () => (autoLabel.textContent = `自动检查更新：${autoCheckEnabled() ? "开" : "关"}`);
   renderAuto();
-  autoRow.append(el("span", "glyph", String.fromCodePoint(0xe713)), autoLabel);
+  autoRow.append(glyphEl(String.fromCodePoint(0xe713)), autoLabel);
   autoRow.title = "开启时每 6 小时访问 github.com 检查新版本；关闭后只在你点“检查更新”时联网";
   autoRow.onclick = () => { setAutoCheck(!autoCheckEnabled()); renderAuto(); };
   launcher.append(autoRow);
@@ -1203,7 +1229,7 @@ function renderLauncher() {
     renderLabel.textContent = `渲染器：${RENDER_NAMES[rendererPref]}${rendererPref === "auto" ? `（当前 ${now}${remoteSession ? "，远程桌面" : ""}）` : ""}`;
   };
   renderRender();
-  renderRow.append(el("span", "glyph", String.fromCodePoint(0xe7f4)), renderLabel);
+  renderRow.append(glyphEl(String.fromCodePoint(0xe7f4)), renderLabel);
   renderRow.title = "GPU（WebGL）更快；兼容（DOM）不用 GPU 纹理，远程桌面下不会出现字形错乱。自动 = 远程桌面用兼容，其他用 GPU。点击切换";
   renderRow.onclick = () => {
     const order: RendererPref[] = ["auto", "webgl", "dom"];
@@ -1212,7 +1238,7 @@ function renderLauncher() {
   };
   launcher.append(renderRow);
   const logRow = el("div", "menu-item");
-  logRow.append(el("span", "glyph", String.fromCodePoint(0xe8a5)), el("span", "grow", "查看更新日志"));
+  logRow.append(glyphEl(String.fromCodePoint(0xe8a5)), el("span", "grow", "查看更新日志"));
   logRow.onclick = () => { launcher.hidden = true; openUpdateLog(); };
   launcher.append(logRow);
 }
@@ -1227,11 +1253,13 @@ document.addEventListener("keydown", (e) => {
 });
 $<HTMLButtonElement>("#new-tab").onmouseenter = (e) => {
   const dir = active?.cwd ?? platform.home;
-  (e.target as HTMLElement).title = `新建 ${defaultProfile().name}${dir ? `（${prettyDir(dir)}）` : ""}  Ctrl+Shift+T`;
+  (e.target as HTMLElement).title = `新建 ${defaultProfile().name}${dir ? `（${prettyDir(dir)}）` : ""}  ${shortcut("T")}`;
 };
 
 async function init() {
   platform = await invoke<Platform>("platform_info");
+  document.body.classList.add(`os-${platform.os}`);
+  $<HTMLButtonElement>("#repaint").title = `重绘画面 (${shortcut("R")})`;
   remoteSession = await invoke<boolean>("is_remote_session").catch(() => false);
   await document.fonts.ready; // measure cell size with the real font, not a fallback
 
