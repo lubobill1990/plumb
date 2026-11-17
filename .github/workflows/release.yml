@@ -36,7 +36,8 @@ permissions:
 
 env:
   TAG: ${{ github.event.inputs.tag || github.ref_name }}
-  SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
+  # (not named SIGN: linuxdeploy's appimage plugin GPG-signs whenever $SIGN is set)
+  SIGNPATH_SIGN: ${{ vars.SIGNPATH_ORGANIZATION_ID != '' }}
   BUNDLE_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
 
 jobs:
@@ -88,7 +89,7 @@ jobs:
 
       # ---- Authenticode: plumb.exe ----
       - name: Upload exe for signing
-        if: env.SIGN == 'true'
+        if: env.SIGNPATH_SIGN == 'true'
         id: up-exe
         uses: actions/upload-artifact@v4
         with:
@@ -97,7 +98,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign plumb.exe (SignPath)
-        if: env.SIGN == 'true'
+        if: env.SIGNPATH_SIGN == 'true'
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -113,7 +114,7 @@ jobs:
             version: "${{ steps.v.outputs.version }}"
 
       - name: Put the signed exe back
-        if: env.SIGN == 'true'
+        if: env.SIGNPATH_SIGN == 'true'
         run: |
           $s = Get-AuthenticodeSignature signed/exe/plumb.exe
           if ($s.Status -ne 'Valid') { throw "signed plumb.exe: $($s.Status) $($s.StatusMessage)" }
@@ -124,7 +125,7 @@ jobs:
         run: |
           Remove-Item src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue
           npx tauri bundle --ci --bundles nsis --config $env:BUNDLE_CONFIG
-          if ($env:SIGN -eq 'true') {
+          if ($env:SIGNPATH_SIGN -eq 'true') {
             # the embedded exe must still carry its signature
             Remove-Item unpacked -Recurse -Force -ErrorAction SilentlyContinue
             7z x -y -ounpacked "src-tauri/target/release/bundle/nsis/${{ steps.v.outputs.installer }}" plumb.exe | Out-Null
@@ -136,7 +137,7 @@ jobs:
 
       # ---- Authenticode: the installer ----
       - name: Upload installer for signing
-        if: env.SIGN == 'true'
+        if: env.SIGNPATH_SIGN == 'true'
         id: up-installer
         uses: actions/upload-artifact@v4
         with:
@@ -145,7 +146,7 @@ jobs:
           if-no-files-found: error
 
       - name: Sign the installer (SignPath)
-        if: env.SIGN == 'true'
+        if: env.SIGNPATH_SIGN == 'true'
         uses: signpath/github-action-submit-signing-request@v3
         with:
           api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
@@ -163,11 +164,11 @@ jobs:
       - name: Collect the release files
         run: |
           New-Item -ItemType Directory -Force dist-release | Out-Null
-          $src = if ($env:SIGN -eq 'true') { 'signed/installer' } else { 'to-sign/installer' }
+          $src = if ($env:SIGNPATH_SIGN -eq 'true') { 'signed/installer' } else { 'to-sign/installer' }
           Copy-Item "$src/${{ steps.v.outputs.installer }}" dist-release/
           $s = Get-AuthenticodeSignature "dist-release/${{ steps.v.outputs.installer }}"
           "installer signature: $($s.Status) $($s.SignerCertificate.Subject)"
-          if ($env:SIGN -eq 'true' -and $s.Status -ne 'Valid') { throw "installer not validly signed" }
+          if ($env:SIGNPATH_SIGN -eq 'true' -and $s.Status -ne 'Valid') { throw "installer not validly signed" }
 
       - name: Keep the Windows files for the publish job
         uses: actions/upload-artifact@v4
@@ -217,10 +218,15 @@ jobs:
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
       - name: Build + sign (Developer ID)
+        if: env.HAS_APPLE == 'true'
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APP_P12_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: "${{ secrets.APPLE_DEVELOPER_ID_APP_P12 != '' && (vars.APPLE_SIGNING_IDENTITY || 'Developer ID Application: Suzhou Zhishi Miaoyan Software Technology Co., Ltd (QTKH7M6UMC)') || '' }}"
+          APPLE_SIGNING_IDENTITY: "${{ vars.APPLE_SIGNING_IDENTITY || 'Developer ID Application: Suzhou Zhishi Miaoyan Software Technology Co., Ltd (QTKH7M6UMC)' }}"
+        run: npx tauri build --ci --target universal-apple-darwin --bundles app,dmg --config "$BUNDLE_CONFIG"
+
+      - name: Build (unsigned - no APPLE_* secrets yet)
+        if: env.HAS_APPLE != 'true'
         run: npx tauri build --ci --target universal-apple-darwin --bundles app,dmg --config "$BUNDLE_CONFIG"
 
       - name: Notarize (20 min limit) + staple
@@ -405,7 +411,7 @@ jobs:
           cd dist-release
           mac_status=$(cat macos-status.txt); rm -f macos-status.txt
           win_note='Windows: NSIS per-user installer'
-          [ "$SIGN" = "true" ] && win_note="$win_note, code-signed (certificate by SignPath Foundation)" || win_note="$win_note, not code-signed yet (SmartScreen: More info -> Run anyway)"
+          [ "$SIGNPATH_SIGN" = "true" ] && win_note="$win_note, code-signed (certificate by SignPath Foundation)" || win_note="$win_note, not code-signed yet (SmartScreen: More info -> Run anyway)"
           case "$mac_status" in
             *macos-signed=true*notarized=true*) mac_note='macOS: universal dmg, signed (Developer ID: Suzhou Zhishi Miaoyan Software Technology Co., Ltd) and notarized' ;;
             *macos-signed=true*) mac_note='macOS: universal dmg, signed (Developer ID: Suzhou Zhishi Miaoyan Software Technology Co., Ltd), notarization pending: first launch via System Settings > Privacy & Security > Open Anyway' ;;
