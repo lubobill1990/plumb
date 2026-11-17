@@ -7,6 +7,7 @@
 # PKGS holds, signed with the release key (Plumb_<v>_universal.app.tar.gz / _amd64.AppImage
 # plus .sig): A and B good builds, C a broken build (exits on a normal start).
 set -uo pipefail
+export PLUMB_UPDATER_NO_ALERT=1 # the updater logs instead of showing a dialog nobody clicks
 : "${PKGS:?}" "${A:?}" "${B:?}" "${C:?}"
 fail=0
 os=$(uname -s)

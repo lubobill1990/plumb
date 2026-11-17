@@ -513,8 +513,13 @@ fn launch(target: &Path) -> Result<u32, String> {
     cmd.spawn().map(|c| c.id()).map_err(|e| format!("{}：{e}", exe.display()))
 }
 
-/// Native message box (the updater has no window of its own).
+/// Native message box (the updater has no window of its own). PLUMB_UPDATER_NO_ALERT=1
+/// (E2E tests) logs instead: a modal box would wait for a click forever.
 fn alert(text: &str) {
+    if std::env::var_os("PLUMB_UPDATER_NO_ALERT").is_some() {
+        log(&format!("alert (suppressed): {text}"));
+        return;
+    }
     #[cfg(windows)]
     {
         #[link(name = "user32")]
