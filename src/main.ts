@@ -172,13 +172,7 @@ class Tab {
       }
       this.term.focus();
     });
-    try {
-      this.webgl = new WebglAddon();
-      this.webgl.onContextLoss(() => { this.webgl?.dispose(); this.webgl = undefined; });
-      this.term.loadAddon(this.webgl);
-    } catch {
-      this.webgl = undefined; // fall back to DOM renderer
-    }
+    if (useWebgl()) this.attachWebgl();
 
     this.term.onTitleChange((t) => this.setTitle(t || this.profile.name));
     this.term.onData((data) => {
@@ -432,11 +426,13 @@ ${this.cwd}` : this.title;
    * Ink, vim, ...) gets a resize event and redraws from scratch.
    */
   repaint() {
+    // garbled glyphs (GPU textures lost, e.g. after a Remote Desktop reconnect) need new
+    // renderers; the PTY nudge below only makes the app redraw its text
+    scheduleRendererRebuild(0);
     if (this.id === null || this.exited) return;
     const id = this.id;
     this.fitNow();
     const { cols, rows } = this.term;
-    this.webgl?.clearTextureAtlas();
     void invoke("pty_resize", { id, cols: Math.max(cols - 1, 2), rows })
       .then(() => sleep(40))
       .then(() => invoke("pty_resize", { id, cols: this.term.cols, rows: this.term.rows }))
@@ -446,6 +442,29 @@ ${this.cwd}` : this.title;
 
   fitNow() {
     if (this.host.offsetWidth > 0 && this.host.offsetHeight > 0) this.fit.fit();
+  }
+
+  /** GPU renderer: a new WebGL context with its own glyph textures. */
+  attachWebgl() {
+    if (this.webgl) return;
+    try {
+      const webgl = new WebglAddon();
+      webgl.onContextLoss(() => {
+        // the context is gone: drop to the DOM renderer, then try a fresh one
+        this.dropWebgl();
+        scheduleRendererRebuild(1000);
+      });
+      this.term.loadAddon(webgl);
+      this.webgl = webgl;
+    } catch {
+      this.webgl = undefined; // no WebGL: xterm's DOM renderer stays
+    }
+  }
+
+  /** Back to xterm's DOM renderer. */
+  dropWebgl() {
+    this.webgl?.dispose();
+    this.webgl = undefined;
   }
 
   /** Remove the tab from this window (does not touch the backend session). */
@@ -718,6 +737,82 @@ termsEl.addEventListener("wheel", (e) => {
   e.stopPropagation(); // don't let xterm scroll the buffer
   setFontSize(fontSize + (e.deltaY < 0 ? 1 : -1));
 }, { passive: false, capture: true });
+
+// ---------------------------------------------------------------------------
+// renderer: WebGL (fast) or DOM (no GPU textures to lose)
+//
+// xterm's WebGL renderer draws every character from a glyph atlas uploaded to GPU
+// textures. Under Remote Desktop (RDP, Windows 365 / Cloud PC) the GPU device behind
+// Chromium can be replaced on reconnect / unlock / display change without a WebGL
+// context-loss event, and the textures turn to garbage: every glyph shows as fragments.
+// clearTextureAtlas() re-uploads into the same broken textures, so it doesn't help; a
+// window resize does, because it makes xterm build a new atlas with new textures.
+// rebuildRenderers() does that on purpose. In a remote session "auto" uses the DOM
+// renderer, which has no textures to lose.
+// ---------------------------------------------------------------------------
+type RendererPref = "auto" | "webgl" | "dom";
+let rendererPref: RendererPref = (localStorage.getItem("renderer") as RendererPref) || "auto";
+let remoteSession = false;
+
+function useWebgl() {
+  return rendererPref === "webgl" || (rendererPref === "auto" && !remoteSession);
+}
+
+/**
+ * Throw every WebGL renderer away and make new ones. All of them go first: they share
+ * one glyph atlas, which is only released (and later rebuilt on fresh canvases and
+ * textures) once no renderer holds it.
+ */
+function rebuildRenderers() {
+  for (const t of tabs) t.dropWebgl();
+  for (const t of tabs) {
+    if (useWebgl()) t.attachWebgl();
+    t.term.refresh(0, t.term.rows - 1);
+  }
+}
+
+let rebuildTimer = 0;
+function scheduleRendererRebuild(delayMs = 300) {
+  clearTimeout(rebuildTimer);
+  rebuildTimer = window.setTimeout(rebuildRenderers, delayMs);
+}
+
+function setRendererPref(p: RendererPref) {
+  rendererPref = p;
+  localStorage.setItem("renderer", p);
+  scheduleRendererRebuild(0);
+}
+
+async function refreshRemoteSession() {
+  const remote = await invoke<boolean>("is_remote_session").catch(() => false);
+  if (remote === remoteSession) return;
+  remoteSession = remote; // e.g. the same Plumb now reached over RDP
+  if (rendererPref === "auto") scheduleRendererRebuild(0);
+}
+
+// Moments where the GPU device may have been swapped under us: coming back to the
+// window after a while (RDP reconnect, unlock, resume), un-minimizing, DPI change.
+const AWAY_MS = 30_000;
+let blurredAt = 0;
+let hiddenAt = 0;
+void appWindow.onFocusChanged(({ payload: focused }) => {
+  if (!focused) {
+    blurredAt = Date.now();
+    return;
+  }
+  void refreshRemoteSession();
+  if (blurredAt && Date.now() - blurredAt > AWAY_MS) scheduleRendererRebuild();
+  blurredAt = 0;
+});
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) {
+    hiddenAt = Date.now();
+    return;
+  }
+  if (hiddenAt && Date.now() - hiddenAt > 2000) scheduleRendererRebuild();
+  hiddenAt = 0;
+});
+void appWindow.onScaleChanged(() => scheduleRendererRebuild());
 
 // ---------------------------------------------------------------------------
 // tab context menu
@@ -1100,6 +1195,22 @@ function renderLauncher() {
   autoRow.title = "开启时每 6 小时访问 github.com 检查新版本；关闭后只在你点“检查更新”时联网";
   autoRow.onclick = () => { setAutoCheck(!autoCheckEnabled()); renderAuto(); };
   launcher.append(autoRow);
+  const renderRow = el("div", "menu-item");
+  const renderLabel = el("span", "grow", "");
+  const RENDER_NAMES: Record<RendererPref, string> = { auto: "自动", webgl: "GPU", dom: "兼容" };
+  const renderRender = () => {
+    const now = useWebgl() ? "GPU" : "兼容";
+    renderLabel.textContent = `渲染器：${RENDER_NAMES[rendererPref]}${rendererPref === "auto" ? `（当前 ${now}${remoteSession ? "，远程桌面" : ""}）` : ""}`;
+  };
+  renderRender();
+  renderRow.append(el("span", "glyph", String.fromCodePoint(0xe7f4)), renderLabel);
+  renderRow.title = "GPU（WebGL）更快；兼容（DOM）不用 GPU 纹理，远程桌面下不会出现字形错乱。自动 = 远程桌面用兼容，其他用 GPU。点击切换";
+  renderRow.onclick = () => {
+    const order: RendererPref[] = ["auto", "webgl", "dom"];
+    setRendererPref(order[(order.indexOf(rendererPref) + 1) % order.length]);
+    renderRender();
+  };
+  launcher.append(renderRow);
   const logRow = el("div", "menu-item");
   logRow.append(el("span", "glyph", String.fromCodePoint(0xe8a5)), el("span", "grow", "查看更新日志"));
   logRow.onclick = () => { launcher.hidden = true; openUpdateLog(); };
@@ -1121,6 +1232,7 @@ $<HTMLButtonElement>("#new-tab").onmouseenter = (e) => {
 
 async function init() {
   platform = await invoke<Platform>("platform_info");
+  remoteSession = await invoke<boolean>("is_remote_session").catch(() => false);
   await document.fonts.ready; // measure cell size with the real font, not a fallback
 
   const attachId = (window as { __ATTACH__?: number | null }).__ATTACH__;
