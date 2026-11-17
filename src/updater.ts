@@ -181,7 +181,14 @@ export async function initUpdater(bannerEl: HTMLElement, opts: { autoCheck: bool
   void invoke("update_mark_healthy");
   rollbackTo = await invoke<string | null>("update_rollback_version").catch(() => null);
   const last = await invoke<UpdateState | null>("update_state").catch(() => null);
-  if (last?.result && !last.acknowledged) outcome = last;
+  if (last?.result && !last.acknowledged) {
+    // Only news if it still describes this install: "updated to X" when we are X; a
+    // failure when we are not X (e.g. X was then installed by hand: nothing to report).
+    const running = await currentVersion;
+    const relevant = last.result === "ok" ? last.to === running : last.to !== running;
+    if (relevant) outcome = last;
+    else void invoke("update_ack");
+  }
   renderBanner();
 
   if (!opts.autoCheck) return;
