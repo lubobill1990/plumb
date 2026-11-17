@@ -1,0 +1,113 @@
+name: Updater E2E
+
+# The real updater against real signed packages, on macOS and Linux (Windows: run
+# scripts/updater-e2e/interactive.ps1 on a desktop session, see its README).
+# Builds three versions - A and B good, C broken (exits on a normal start) - signs them
+# with the release key and runs scripts/updater-e2e/run.sh: update, manual rollback,
+# update again, broken release -> automatic rollback, downgrade and tampered package
+# refused.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - src-tauri/src/update.rs
+      - src-tauri/src/main.rs
+      - src/updater.ts
+      - scripts/updater-e2e/**
+      - .github/workflows/updater-e2e.yml
+
+concurrency:
+  group: updater-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-22.04]
+    env:
+      A: 0.9.0
+      B: 0.9.1
+      C: 0.9.2
+      BUNDLE_CONFIG: '{"bundle":{"createUpdaterArtifacts":false}}'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Linux system libraries (+ xvfb, FUSE for the AppImage)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev patchelf xvfb libfuse2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm ci
+
+      - name: Build A, B (good) and C (broken); sign them
+        shell: bash
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          NO_STRIP: "true"
+          APPIMAGE_EXTRACT_AND_RUN: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p pkgs
+          setv() {
+            node -e '
+              const fs = require("fs"), v = process.argv[1];
+              const c = "src-tauri/tauri.conf.json"; const j = JSON.parse(fs.readFileSync(c, "utf8")); j.version = v; fs.writeFileSync(c, JSON.stringify(j, null, 2) + "\n");
+              const t = "src-tauri/Cargo.toml"; fs.writeFileSync(t, fs.readFileSync(t, "utf8").replace(/^version = "[^"]+"/m, `version = "${v}"`));
+            ' "$1"
+          }
+          build() {
+            local v=$1
+            setv "$v"
+            if [ "$RUNNER_OS" = macOS ]; then
+              npx tauri build --ci --bundles app --config "$BUNDLE_CONFIG"
+              ls src-tauri/target/release/bundle/macos/Plumb.app/Contents/MacOS/
+              tar -czf "pkgs/Plumb_${v}_universal.app.tar.gz" -C src-tauri/target/release/bundle/macos Plumb.app
+              f="pkgs/Plumb_${v}_universal.app.tar.gz"
+            else
+              npx tauri build --ci --bundles appimage --config "$BUNDLE_CONFIG"
+              cp "$(ls src-tauri/target/release/bundle/appimage/*.AppImage)" "pkgs/Plumb_${v}_amd64.AppImage"
+              rm -f src-tauri/target/release/bundle/appimage/*.AppImage
+              f="pkgs/Plumb_${v}_amd64.AppImage"
+            fi
+            npx tauri signer sign "$f"
+          }
+          build "$A"
+          build "$B"
+          # C: keeps --version and --updater, dies on a normal start
+          node -e '
+            const fs = require("fs"), f = "src-tauri/src/main.rs";
+            const s = fs.readFileSync(f, "utf8"), t = s.replace("_ => plumb_lib::run(),", "_ => std::process::exit(3),");
+            if (s === t) throw new Error("main.rs anchor not found");
+            fs.writeFileSync(f, t);
+          '
+          build "$C"
+          git checkout -- src-tauri/src/main.rs src-tauri/tauri.conf.json src-tauri/Cargo.toml src-tauri/Cargo.lock
+          ls -la pkgs
+
+      - name: Scenarios (macOS)
+        if: runner.os == 'macOS'
+        run: PKGS="$PWD/pkgs" bash scripts/updater-e2e/run.sh
+
+      - name: Scenarios (Linux, under xvfb)
+        if: runner.os == 'Linux'
+        env:
+          WEBKIT_DISABLE_COMPOSITING_MODE: "1"
+        run: PKGS="$PWD/pkgs" xvfb-run -a bash scripts/updater-e2e/run.sh
