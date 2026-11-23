@@ -4,12 +4,11 @@
  * - check: `latest.json` of the newest GitHub Release, strictly newer versions only
  * - download: in the background; minisign signature + version binding verified in Rust
  * - install: never on our own. A restart ends every session in every window, so the user
- *   clicks "restart to update" (and confirms when sessions are open). Then a dedicated
- *   updater program (`plumb.exe --updater`, run from a copy outside the install dir)
- *   waits for Plumb to exit, backs up the install, installs, checks the new version
- *   starts healthy, and rolls back to the backup if not.
- * - monitor: the updater records each phase in updates/state.json + update.log; the next
- *   start of Plumb shows the outcome (updated / rolled back / failed) with the log.
+ *   clicks "restart to update" (and confirms when sessions are open). Then Plumb starts
+ *   the verified installer silently and exits; the installer closes Plumb, installs and
+ *   starts the new version. Rollback = reinstall the previous version's kept installer.
+ * - monitor: the hand-over is recorded in updates/state.json + update.log; the next start
+ *   of Plumb settles and shows the outcome (updated / failed) with the log.
  * - "skip" hides one version's banner; a manual check shows it again.
  */
 import { Channel, invoke } from "@tauri-apps/api/core";
@@ -81,12 +80,12 @@ function renderBanner() {
     banner.title = "点击安装并重启";
     banner.hidden = false;
   } else if (status.kind === "installing") {
-    label.textContent = `正在交给更新程序安装 ${status.version}…`;
+    label.textContent = `正在交给安装包安装 ${status.version}…`;
     banner.dataset.action = "";
     banner.hidden = false;
   } else if (outcome) {
     const ok = outcome.result === "ok";
-    label.textContent = ok ? `已更新到 Plumb ${outcome.to}` : outcome.message || `更新到 ${outcome.to} 失败`;
+    label.textContent = outcome.message || (ok ? `已更新到 Plumb ${outcome.to}` : `更新到 ${outcome.to} 失败`);
     banner.classList.toggle("bad", !ok);
     banner.dataset.action = "log";
     banner.title = "点击查看更新日志";
@@ -134,7 +133,7 @@ async function confirmRestart(what: string) {
   );
 }
 
-/** Hand over to the updater program; Plumb quits and comes back as the new version. */
+/** Hand over to the installer; Plumb quits and comes back as the new version. */
 export async function installUpdate() {
   if (!ready) return;
   if (!(await confirmRestart(`安装 ${ready} `))) return;
@@ -163,7 +162,7 @@ export function openUpdateLog() {
 
 /**
  * Wire the title-bar banner. Call after the window is up and the first tab started:
- * that is what the updater waits for to call a new version healthy.
+ * that is when the "healthy" marker is written (Plumb <= 0.1.5's updater waits for it).
  */
 export async function initUpdater(bannerEl: HTMLElement, opts: { autoCheck: boolean }) {
   banner = bannerEl;

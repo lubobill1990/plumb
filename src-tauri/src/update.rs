@@ -1,23 +1,19 @@
-//! Plumb's self-updater, modelled on Longarm's update service.
+//! Plumb's self-updater.
 //!
-//! Two halves share this module:
+//! The app (Tauri commands in lib.rs) checks GitHub Releases, downloads a newer installer
+//! and verifies it. When the user says so it verifies it again, records the hand-over in
+//! `updates\state.json`, starts the NSIS installer silently (`/S /R`) and exits; the
+//! installer closes Plumb, installs and starts the new version. The next start of Plumb
+//! settles the outcome (are we the version that was to be installed?) and shows it.
+//! Rollback = the same, with the previous version's installer kept in `downloads`.
+//! `updates\update.log` has the human-readable story.
 //!
-//! * the app (Tauri commands in lib.rs) checks GitHub Releases, downloads a newer
-//!   installer and verifies it, then hands over to
-//! * the updater program: `plumb.exe --updater apply ...`, run from a copy in
-//!   `%LOCALAPPDATA%\com.lubobill1990.plumb\updates` (outside the install dir, so the
-//!   installer can replace it and the backup doesn't copy itself). It waits
-//!   for Plumb to exit, backs up the install, runs the installer, checks the new version
-//!   and that it starts healthy, and rolls back to the backup when any step fails.
-//!
-//! Every step lands in `updates\state.json` (machine-readable, shown by the app on its
-//! next start) and `updates\update.log` (human-readable).
-//!
-//! What gets installed must be (like Longarm's `longarm-update.exe`):
+//! What gets installed must be:
 //! * signed with the release key whose public half is built in (`updater.pub`);
 //! * for exactly this version: the minisign trusted comment must name
 //!   `Plumb_<version>_x64-setup.exe`, so an older release's signature can't be replayed;
-//! * strictly newer than the running version (no downgrades over the network).
+//! * strictly newer than the running version (no downgrades over the network; a
+//!   rollback reinstalls an installer that was itself verified when downloaded).
 
 use base64::Engine;
 use minisign_verify::{PublicKey, Signature};
@@ -26,23 +22,22 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const MANIFEST_URL: &str = "https://github.com/lubobill1990/plumb/releases/latest/download/latest.json";
 /// `tauri signer generate` output: base64 of the minisign public key file.
 const PUBKEY_FILE: &str = include_str!("../updater.pub");
-/// How long a freshly installed version gets to report healthy.
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
-const EXIT_TIMEOUT: Duration = Duration::from_secs(30);
-/// Uninstall entry written by the NSIS installer (per-user install).
-const UNINSTALL_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\Plumb";
+/// `state.json` phase while the installer is at work (Plumb has exited).
+const HANDED_OVER: &str = "handed-over";
+/// Plumb opened by hand this soon after a hand-over: the installer may still be running.
+const INSTALL_GRACE_SECS: u64 = 120;
+/// An unfinished update of the old updater program not touched for this long is dead.
+const STALE_SECS: u64 = 600;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 #[cfg(windows)]
 const DETACHED: u32 = 0x0000_0008 | 0x0000_0200; // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
-#[cfg(windows)]
-const NO_WINDOW: u32 = 0x0800_0000;
 
 pub fn current_version() -> &'static str {
     env!("CARGO_PKG_VERSION")
@@ -56,9 +51,8 @@ pub fn installer_name(version: &str) -> String {
 // paths, log, state
 // ---------------------------------------------------------------------------
 
-/// Outside the install dir (%LOCALAPPDATA%\Plumb): the backup copies the install dir, and
-/// the installer may clean it while the updater runs. This is the app's data dir (named
-/// after the bundle identifier), next to the WebView2 profile.
+/// Outside the install dir (%LOCALAPPDATA%\Plumb), which the installer rewrites. This is
+/// the app's data dir (named after the bundle identifier), next to the WebView2 profile.
 pub fn updates_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     base.join("com.lubobill1990.plumb").join("updates")
@@ -66,10 +60,6 @@ pub fn updates_dir() -> PathBuf {
 
 fn downloads_dir() -> PathBuf {
     updates_dir().join("downloads")
-}
-
-pub fn rollback_dir() -> PathBuf {
-    updates_dir().join("rollback")
 }
 
 pub fn log_path() -> PathBuf {
@@ -99,17 +89,21 @@ pub fn log(msg: &str) {
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct UpdateState {
-    /// waiting | backup | installing | verifying | health-check | rolling-back | done
+    /// handed-over | done (the old updater program also wrote waiting, backup,
+    /// installing, verifying, health-check, rolling-back)
     pub phase: String,
     pub from: String,
     pub to: String,
-    /// "ok" | "rolled-back" | "failed" once finished
+    /// "ok" | "failed" once finished (the old updater also wrote "rolled-back")
     pub result: Option<String>,
     pub message: String,
     pub started: u64,
     pub updated: u64,
     /// The app has shown the result to the user.
     pub acknowledged: bool,
+    /// A rollback the user asked for, not an update.
+    #[serde(default)]
+    pub rollback: bool,
 }
 
 pub fn read_state() -> Option<UpdateState> {
@@ -132,18 +126,9 @@ fn phase(s: &mut UpdateState, phase: &str, message: &str) {
     log(&format!("{} -> {}: {phase}: {message}", s.from, s.to));
 }
 
-fn backup_version() -> Option<String> {
-    let v = fs::read_to_string(rollback_dir().join("VERSION")).ok()?.trim().to_string();
-    (!v.is_empty()).then_some(v)
-}
-
-/// The version backed up by the last update, if it differs from the running one (what
-/// "roll back" in the app would restore).
-pub fn rollback_version() -> Option<String> {
-    backup_version().filter(|v| v != current_version())
-}
-
-/// Called by the app once it is up (window open, first tab spawned).
+/// Called by the app once it is up (window open, first tab spawned). Nothing in this
+/// version waits for it, but the updater program of Plumb <= 0.1.5 does: updating from
+/// such a version, it starts us and rolls back unless `healthy-<version>` appears.
 pub fn mark_healthy() {
     let _ = fs::create_dir_all(updates_dir());
     let _ = fs::write(health_marker(current_version()), now().to_string());
@@ -224,7 +209,7 @@ pub fn verify(bytes: &[u8], signature: &str, version: &str) -> Result<(), String
 }
 
 /// Download + verify; returns the installer path (its signature is saved next to it,
-/// so the updater program checks it again right before installing).
+/// so it is checked again right before it runs, and later for a rollback).
 pub fn download(av: &Available, mut progress: impl FnMut(u64, Option<u64>)) -> Result<PathBuf, String> {
     let resp = agent().get(&av.url).call().map_err(|e| format!("下载失败：{e}"))?;
     let total = resp.header("Content-Length").and_then(|v| v.parse::<u64>().ok());
@@ -252,408 +237,151 @@ pub fn download(av: &Available, mut progress: impl FnMut(u64, Option<u64>)) -> R
 }
 
 // ---------------------------------------------------------------------------
-// handing over to the updater program
+// handing over to the installer
+//
+// Plumb used to run a copy (later a hard link) of its own exe from AppData as a dedicated
+// updater, which then moved the install dir aside as a backup. To Defender's ML that is
+// what a dropper does: twice it convicted the unsigned plumb.exe (Trojan:Win32/Bearfoos
+// .A!ml / .B!ml) mid-update and quarantined the app, its shortcuts and uninstall key. Now
+// the downloaded NSIS installer does the whole job, as with Tauri's own updater: in silent
+// mode it closes the running Plumb (Restart Manager), installs, and with /R starts the
+// new version. Plumb never runs a copy of itself or moves its own files.
 // ---------------------------------------------------------------------------
 
-fn install_dir() -> Result<PathBuf, String> {
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    exe.parent().map(Path::to_path_buf).ok_or_else(|| "找不到安装目录".into())
+/// Signature + version binding of a downloaded installer, checked again right before it
+/// runs (it sat on disk since the download).
+fn verified_installer(version: &str) -> Result<PathBuf, String> {
+    let installer = downloads_dir().join(installer_name(version));
+    let signature = fs::read_to_string(installer.with_extension("exe.sig")).map_err(|_| format!("缺少 {} 的签名文件", installer_name(version)))?;
+    let bytes = fs::read(&installer).map_err(|e| format!("读取 {} 失败：{e}", installer_name(version)))?;
+    verify(&bytes, &signature, version)?;
+    Ok(installer)
 }
 
-/// Copy this exe out of the install dir and start it as the updater. The caller exits next.
-pub fn spawn_updater(args: &[String]) -> Result<(), String> {
-    let dir = updates_dir();
-    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-    let updater = dir.join("plumb-updater.exe");
-    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-    // A hard link (same file, second name; same volume: both under %LOCALAPPDATA%), not a
-    // copy. An unsigned app writing a copy of itself into AppData and running it is what
-    // Defender's ML flagged (Trojan:Win32/Bearfoos.B!ml) - then it quarantined Plumb.
-    let _ = fs::remove_file(&updater);
-    if let Err(e) = fs::hard_link(&exe, &updater) {
-        log(&format!("hard link failed ({e}); copying the updater instead"));
-        fs::copy(&exe, &updater).map_err(|e| format!("无法准备更新程序：{e}"))?;
-    }
-    let mut cmd = Command::new(&updater);
-    cmd.arg("--updater").args(args).current_dir(&dir);
+/// `/S` silent (closes a running Plumb on its own), `/R` start Plumb when done.
+/// Detached: it outlives this process, which exits next.
+fn run_installer(installer: &Path) -> Result<(), String> {
+    let mut cmd = Command::new(installer);
+    cmd.args(["/S", "/R"]).current_dir(downloads_dir());
     #[cfg(windows)]
     cmd.creation_flags(DETACHED);
-    cmd.spawn().map_err(|e| format!("无法启动更新程序：{e}"))?;
-    Ok(())
+    cmd.spawn().map(|_| ()).map_err(|e| format!("无法运行安装包：{e}"))
 }
 
-pub fn start_apply(version: &str) -> Result<(), String> {
-    let installer = downloads_dir().join(installer_name(version));
-    if !installer.is_file() {
-        return Err(format!("没有找到已下载的 {}", installer_name(version)));
-    }
-    let dir = install_dir()?;
-    log(&format!("handing over to the updater: {} -> {version}", current_version()));
+fn hand_over(to: &str, rollback: bool, installer: &Path) -> Result<(), String> {
+    let from = current_version();
+    let what = if rollback { format!("回滚到 {to}") } else { format!("安装 {to}") };
     write_state(&UpdateState {
-        phase: "waiting".into(),
-        from: current_version().into(),
-        to: version.into(),
-        message: "等待 Plumb 退出".into(),
+        phase: HANDED_OVER.into(),
+        from: from.into(),
+        to: to.into(),
+        message: format!("{what}：已交给安装包"),
         started: now(),
         updated: now(),
+        rollback,
         ..Default::default()
     });
-    spawn_updater(&[
-        "apply".into(),
-        "--version".into(),
-        version.into(),
-        "--from".into(),
-        current_version().into(),
-        "--install-dir".into(),
-        dir.display().to_string(),
-        "--pid".into(),
-        std::process::id().to_string(),
-    ])
+    log(&format!("{from} -> {to}: running {} /S /R", installer.display()));
+    run_installer(installer).inspect_err(|e| {
+        let mut s = read_state().unwrap_or_default();
+        s.result = Some("failed".into());
+        phase(&mut s, "done", &format!("{what}失败：{e}"));
+    })
 }
 
+/// Install a downloaded, verified, strictly newer version. The caller exits right after.
+pub fn start_apply(version: &str) -> Result<(), String> {
+    if !is_newer(version, current_version()) {
+        return Err(format!("{version} 不比 {} 新，拒绝安装", current_version()));
+    }
+    let installer = verified_installer(version)?;
+    hand_over(version, false, &installer)
+}
+
+/// Reinstall the previous version from its kept (and re-verified) installer.
 pub fn start_rollback() -> Result<(), String> {
     let to = rollback_version().ok_or("没有可回滚的版本")?;
-    let dir = install_dir()?;
-    write_state(&UpdateState {
-        phase: "waiting".into(),
-        from: current_version().into(),
-        to: to.clone(),
-        message: "等待 Plumb 退出（手动回滚）".into(),
-        started: now(),
-        updated: now(),
-        ..Default::default()
-    });
-    spawn_updater(&[
-        "rollback".into(),
-        "--from".into(),
-        current_version().into(),
-        "--install-dir".into(),
-        dir.display().to_string(),
-        "--pid".into(),
-        std::process::id().to_string(),
-    ])
+    let installer = verified_installer(&to)?;
+    hand_over(&to, true, &installer)
 }
 
-// ---------------------------------------------------------------------------
-// the updater program (`plumb.exe --updater ...`)
-// ---------------------------------------------------------------------------
-
-fn arg(args: &[String], name: &str) -> Option<String> {
-    args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+/// Downloaded installers (with a signature next to them), by version.
+fn kept_installers() -> Vec<semver::Version> {
+    let Ok(entries) = fs::read_dir(downloads_dir()) else { return Vec::new() };
+    let mut found: Vec<semver::Version> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let v = name.strip_prefix("Plumb_")?.strip_suffix("_x64-setup.exe")?.to_string();
+            e.path().with_extension("exe.sig").is_file().then_some(())?;
+            semver::Version::parse(&v).ok()
+        })
+        .collect();
+    found.sort();
+    found
 }
 
-fn process_alive(pid: u32) -> bool {
-    let mut cmd = Command::new("tasklist");
-    cmd.args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"]);
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    cmd.output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
-        .unwrap_or(false)
+/// The newest kept installer older than the running version ("roll back" in the app).
+pub fn rollback_version() -> Option<String> {
+    let current = semver::Version::parse(current_version()).ok()?;
+    kept_installers().into_iter().filter(|v| *v < current).next_back().map(|v| v.to_string())
 }
 
-fn kill_tree(pid: u32) {
-    let mut cmd = Command::new("taskkill");
-    cmd.args(["/T", "/F", "/PID", &pid.to_string()]);
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    let _ = cmd.output();
-}
-
-fn wait_exit(pid: u32, timeout: Duration) -> bool {
-    let t = Instant::now();
-    while t.elapsed() < timeout {
-        if !process_alive(pid) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(300));
-    }
-    false
-}
-
-/// Rename with retries: a just-exited / just-killed process can hold its exe for a moment.
-fn rename_retry(from: &Path, to: &Path) -> Result<(), String> {
-    let mut last = String::new();
-    for _ in 0..20 {
-        match fs::rename(from, to) {
-            Ok(()) => return Ok(()),
-            Err(e) => last = e.to_string(),
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-    Err(format!("{} → {}：{last}", from.display(), to.display()))
-}
-
-fn set_registered_version(version: &str) {
-    #[cfg(windows)]
-    {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_SET_VALUE};
-        if let Ok(k) = winreg::RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(UNINSTALL_KEY, KEY_SET_VALUE) {
-            let _ = k.set_value("DisplayVersion", &version);
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = version;
-}
-
-/// `plumb.exe --version` of the installed exe.
-fn installed_version(dir: &Path) -> Option<String> {
-    let mut cmd = Command::new(dir.join("plumb.exe"));
-    cmd.arg("--version");
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    let out = cmd.output().ok()?;
-    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
-
-fn launch(dir: &Path) -> Result<u32, String> {
-    let exe = dir.join("plumb.exe");
-    let mut cmd = Command::new(&exe);
-    cmd.current_dir(dir);
-    #[cfg(windows)]
-    cmd.creation_flags(DETACHED);
-    cmd.spawn().map(|c| c.id()).map_err(|e| format!("{}：{e}", exe.display()))
-}
-
-/// Native message box (the updater has no window of its own).
-fn alert(text: &str) {
-    #[cfg(windows)]
-    {
-        #[link(name = "user32")]
-        extern "system" {
-            fn MessageBoxW(hwnd: isize, text: *const u16, caption: *const u16, kind: u32) -> i32;
-        }
-        let wide = |s: &str| s.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-        const MB_ICONERROR: u32 = 0x10;
-        const MB_TOPMOST: u32 = 0x4_0000;
-        unsafe {
-            MessageBoxW(0, wide(text).as_ptr(), wide("Plumb 更新").as_ptr(), MB_ICONERROR | MB_TOPMOST);
-        }
-    }
-    #[cfg(not(windows))]
-    let _ = text;
-}
-
-/// Start Plumb again after the updater is done. Never leave the user with nothing: if it
-/// won't start, say why and where the log is.
-fn relaunch(dir: &Path, outcome: &str) {
-    match launch(dir) {
-        Ok(pid) => log(&format!("relaunched Plumb (pid {pid})")),
-        Err(e) => {
-            log(&format!("could not relaunch Plumb: {e}"));
-            alert(&format!(
-                "{outcome}\n\n无法重新启动 Plumb：{e}\n\n请从开始菜单打开 Plumb，或重新安装最新版：\nhttps://github.com/lubobill1990/plumb/releases/latest\n\n更新日志：{}",
-                log_path().display()
-            ));
+/// Drop installers older than the one rollback would use. Newer ones stay: one may be
+/// downloaded and waiting for "restart to update" (another window settles too).
+fn prune_downloads() {
+    let Some(keep_from) = rollback_version().and_then(|v| semver::Version::parse(&v).ok()) else { return };
+    for v in kept_installers() {
+        if v < keep_from {
+            let v = v.to_string();
+            let path = downloads_dir().join(installer_name(&v));
+            let _ = fs::remove_file(path.with_extension("exe.sig"));
+            let _ = fs::remove_file(path);
         }
     }
 }
 
-/// Back up the install dir by **moving** it into updates\rollback (same volume: a rename,
-/// no file content is read or written). Copying made this unsigned updater write a batch
-/// of executables, which antivirus (Defender on a managed PC) blocked with "the file
-/// contains a virus or potentially unwanted software" (os error 225). Returns the version
-/// actually backed up (asked from the exe, not taken from the caller).
-fn backup(dir: &Path, claimed: &str) -> Result<String, String> {
-    let version = installed_version(dir).filter(|v| !v.is_empty()).unwrap_or_else(|| claimed.to_string());
-    let rb = rollback_dir();
-    if rb.exists() {
-        fs::remove_dir_all(&rb).map_err(|e| format!("备份失败：无法清理旧备份 {}：{e}", rb.display()))?;
-    }
-    rename_retry(dir, &rb).map_err(|e| format!("备份失败：{e}"))?;
-    fs::write(rb.join("VERSION"), &version).map_err(|e| e.to_string())?;
-    Ok(version)
-}
-
-/// Checks that need nothing changed yet: signature, version binding, strictly newer.
-fn precheck(s: &UpdateState) -> Result<(), String> {
-    let installer = downloads_dir().join(installer_name(&s.to));
-    let signature = fs::read_to_string(installer.with_extension("exe.sig")).map_err(|_| "缺少签名文件".to_string())?;
-    let bytes = fs::read(&installer).map_err(|e| format!("读取安装包失败：{e}"))?;
-    verify(&bytes, &signature, &s.to)?; // again: the file sat on disk since the download
-    if !is_newer(&s.to, &s.from) {
-        return Err(format!("{} 不比 {} 新，拒绝安装", s.to, s.from));
-    }
-    Ok(())
-}
-
-/// Put the backed-up install back: move whatever is installed now aside, move the backup
-/// into place (renames only), register its version.
-fn restore(dir: &Path) -> Result<String, String> {
-    let rb = rollback_dir();
-    let version = fs::read_to_string(rb.join("VERSION")).map_err(|_| "没有备份可恢复".to_string())?.trim().to_string();
-    if dir.exists() {
-        let aside = updates_dir().join(format!("replaced-{}", now()));
-        rename_retry(dir, &aside).map_err(|e| format!("恢复备份失败：{e}"))?;
-        let _ = fs::remove_dir_all(&aside); // best effort; a leftover is harmless
-    }
-    rename_retry(&rb, dir).map_err(|e| format!("恢复备份失败：{e}"))?;
-    let _ = fs::remove_file(dir.join("VERSION"));
-    set_registered_version(&version);
-    Ok(version)
-}
-
-/// Run the installer, check the result, health-check the new version. Err = roll back.
-fn install_and_check(s: &mut UpdateState, dir: &Path) -> Result<(), String> {
-    let installer = downloads_dir().join(installer_name(&s.to));
-    phase(s, "installing", &format!("运行 {}", installer_name(&s.to)));
-    let mut cmd = Command::new(&installer);
-    cmd.arg("/S");
-    #[cfg(windows)]
-    cmd.creation_flags(NO_WINDOW);
-    let status = cmd.status().map_err(|e| format!("无法运行安装包：{e}"))?;
-    if !status.success() {
-        return Err(format!("安装包退出码 {}", status.code().unwrap_or(-1)));
-    }
-
-    phase(s, "verifying", "核对安装后的版本");
-    let got = installed_version(dir).unwrap_or_default();
-    if got != s.to {
-        return Err(format!("安装后版本是 \"{got}\"，应为 {}", s.to));
-    }
-
-    phase(s, "health-check", "启动新版本，等待它报告正常");
-    let marker = health_marker(&s.to);
-    let _ = fs::remove_file(&marker);
-    let pid = launch(dir).map_err(|e| format!("无法启动新版本：{e}"))?;
-    let t = Instant::now();
-    loop {
-        if marker.exists() {
-            return Ok(());
-        }
-        if !process_alive(pid) {
-            return Err("新版本启动后退出了".into());
-        }
-        if t.elapsed() > HEALTH_TIMEOUT {
-            kill_tree(pid);
-            return Err(format!("新版本 {} 秒内没有报告正常", HEALTH_TIMEOUT.as_secs()));
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-}
-
-fn run_apply(args: &[String]) -> i32 {
-    let (Some(to), Some(from), Some(dir), Some(pid)) = (
-        arg(args, "--version"),
-        arg(args, "--from"),
-        arg(args, "--install-dir").map(PathBuf::from),
-        arg(args, "--pid").and_then(|p| p.parse::<u32>().ok()),
-    ) else {
-        log("apply: missing arguments");
-        return 2;
-    };
-    let mut s = read_state().filter(|s| s.to == to && s.result.is_none()).unwrap_or(UpdateState {
-        from: from.clone(),
-        to: to.clone(),
-        started: now(),
-        ..Default::default()
-    });
-    s.from = from.clone();
-
-    phase(&mut s, "waiting", "等待 Plumb 退出");
-    if !wait_exit(pid, EXIT_TIMEOUT) {
-        s.result = Some("failed".into());
-        phase(&mut s, "done", "Plumb 没有退出，未安装任何东西");
-        return 1;
-    }
-
-    // nothing changed yet: a bad package just means "not installed"
-    if let Err(why) = precheck(&s) {
-        s.result = Some("failed".into());
-        phase(&mut s, "done", &format!("未安装 {to}：{why}"));
-        relaunch(&dir, &s.message.clone());
-        return 1;
-    }
-
-    phase(&mut s, "backup", &format!("备份 {from}"));
-    let from = match backup(&dir, &from) {
-        Ok(v) => v,
-        Err(e) => {
-            s.result = Some("failed".into());
-            phase(&mut s, "done", &format!("{e}；未安装任何东西"));
-            relaunch(&dir, &s.message.clone());
-            return 1;
-        }
-    };
-    s.from = from.clone();
-
-    match install_and_check(&mut s, &dir) {
-        Ok(()) => {
-            s.result = Some("ok".into());
-            phase(&mut s, "done", &format!("已更新到 {to}"));
-            0
-        }
-        Err(why) => {
-            phase(&mut s, "rolling-back", &format!("{why}；回滚到 {from}"));
-            match restore(&dir) {
-                Ok(v) => {
-                    s.result = Some("rolled-back".into());
-                    phase(&mut s, "done", &format!("更新到 {to} 失败（{why}），已回滚到 {v}"));
-                }
-                Err(e) => {
-                    s.result = Some("failed".into());
-                    phase(&mut s, "done", &format!("更新到 {to} 失败（{why}），回滚也失败（{e}）"));
-                }
+/// Leftovers of the old updater program, once it is done (it may still be running: an
+/// older Plumb updating to this one waits for our health marker, then finishes).
+fn remove_old_updater_files() {
+    let dir = updates_dir();
+    let _ = fs::remove_file(dir.join("plumb-updater.exe"));
+    let _ = fs::remove_dir_all(dir.join("rollback"));
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("replaced-") {
+                let _ = fs::remove_dir_all(e.path());
             }
-            relaunch(&dir, &s.message.clone());
-            1
         }
     }
 }
 
-fn run_rollback(args: &[String]) -> i32 {
-    let (Some(from), Some(dir), Some(pid)) = (
-        arg(args, "--from"),
-        arg(args, "--install-dir").map(PathBuf::from),
-        arg(args, "--pid").and_then(|p| p.parse::<u32>().ok()),
-    ) else {
-        log("rollback: missing arguments");
-        return 2;
-    };
-    let to = backup_version().unwrap_or_default();
-    let mut s = UpdateState { from, to: to.clone(), started: now(), ..Default::default() };
-    phase(&mut s, "waiting", "等待 Plumb 退出（手动回滚）");
-    if !wait_exit(pid, EXIT_TIMEOUT) {
-        s.result = Some("failed".into());
-        phase(&mut s, "done", "Plumb 没有退出，未回滚");
-        return 1;
-    }
-    phase(&mut s, "rolling-back", &format!("恢复 {to}"));
-    let code = match restore(&dir) {
-        Ok(v) => {
-            s.result = Some("rolled-back".into());
-            phase(&mut s, "done", &format!("已手动回滚到 {v}"));
-            0
-        }
-        Err(e) => {
-            s.result = Some("failed".into());
-            phase(&mut s, "done", &e);
-            1
-        }
-    };
-    relaunch(&dir, &s.message.clone());
-    code
-}
-
-/// Entry for `plumb.exe --updater <apply|rollback|verify> ...`.
-pub fn run_cli(args: &[String]) -> i32 {
-    log(&format!("updater {} started: {:?}", current_version(), args));
-    match args.first().map(String::as_str) {
-        Some("apply") => run_apply(&args[1..]),
-        Some("rollback") => run_rollback(&args[1..]),
-        // debugging aid: plumb.exe --updater verify <installer> <sig-file> <version>
-        Some("verify") if args.len() == 4 => {
-            let r = fs::read(&args[1])
-                .map_err(|e| e.to_string())
-                .and_then(|b| verify(&b, &fs::read_to_string(&args[2]).unwrap_or_default(), &args[3]));
-            println!("{}", r.as_ref().map(|_| "OK".to_string()).unwrap_or_else(|e| e.clone()));
-            i32::from(r.is_err())
-        }
-        _ => {
-            log("updater: unknown command");
-            2
+/// The last update as the app should show it, settled at start: a hand-over to the
+/// installer has worked if we are now the version it was meant to install.
+pub fn settle_state() -> Option<UpdateState> {
+    let mut s = read_state();
+    let running = current_version();
+    // (opened by hand while the installer is still at work: not a verdict yet)
+    let installing = |st: &UpdateState| running != st.to && now().saturating_sub(st.started) < INSTALL_GRACE_SECS;
+    if let Some(st) = s.as_mut().filter(|st| st.phase == HANDED_OVER && st.result.is_none() && !installing(st)) {
+        let what = if st.rollback { "回滚" } else { "更新" };
+        if running == st.to {
+            st.result = Some("ok".into());
+            let msg = if st.rollback { format!("已回滚到 Plumb {running}") } else { format!("已更新到 Plumb {running}") };
+            phase(st, "done", &msg);
+        } else {
+            st.result = Some("failed".into());
+            let msg = format!("{what}到 {} 没有完成，仍是 {running}（点击查看日志）", st.to);
+            phase(st, "done", &msg);
         }
     }
+    // an old-style updater still at work keeps its files until it reports a result (or
+    // has clearly died: Defender has killed it mid-way before)
+    if s.as_ref().is_none_or(|st| st.result.is_some() || now().saturating_sub(st.updated) > STALE_SECS) {
+        remove_old_updater_files();
+        prune_downloads();
+    }
+    s
 }
 
 #[cfg(test)]
@@ -671,6 +399,67 @@ mod tests {
     #[test]
     fn builtin_public_key_decodes() {
         public_key().expect("updater.pub must be a valid minisign public key");
+    }
+
+    /// One test (not several): it points LOCALAPPDATA at a temp dir for the whole process.
+    #[test]
+    fn handover_settle_rollback_and_cleanup() {
+        let root = std::env::temp_dir().join(format!("plumb-update-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        std::env::set_var("LOCALAPPDATA", &root);
+        let dl = downloads_dir();
+        fs::create_dir_all(&dl).unwrap();
+        let cur = current_version();
+        let stage = |v: &str, sig: bool| {
+            fs::write(dl.join(installer_name(v)), b"x").unwrap();
+            if sig {
+                fs::write(dl.join(installer_name(v)).with_extension("exe.sig"), b"s").unwrap();
+            }
+        };
+        stage("0.0.1", true);
+        stage("0.0.2", true);
+        stage("0.0.3", false); // no signature: not a rollback candidate
+        stage(cur, true);
+        stage("99.0.0", true); // newer: never a rollback target
+        assert_eq!(rollback_version().as_deref(), Some("0.0.2"));
+
+        // the old updater program is mid-update: its files stay
+        let old = UpdateState { phase: "health-check".into(), from: "0.0.2".into(), to: cur.into(), updated: now(), ..Default::default() };
+        write_state(&old);
+        fs::create_dir_all(updates_dir().join("rollback")).unwrap();
+        fs::write(updates_dir().join("plumb-updater.exe"), b"x").unwrap();
+        fs::create_dir_all(updates_dir().join("replaced-1")).unwrap();
+        assert!(settle_state().unwrap().result.is_none());
+        assert!(updates_dir().join("rollback").exists());
+
+        // handed over to the installer, and we are the version it installed
+        let s = UpdateState { phase: HANDED_OVER.into(), from: "0.0.2".into(), to: cur.into(), started: now(), ..Default::default() };
+        write_state(&s);
+        let got = settle_state().unwrap();
+        assert_eq!(got.result.as_deref(), Some("ok"));
+        assert_eq!(got.message, format!("已更新到 Plumb {cur}"));
+        assert!(!updates_dir().join("rollback").exists());
+        assert!(!updates_dir().join("plumb-updater.exe").exists());
+        assert!(!updates_dir().join("replaced-1").exists());
+        // kept: rollback target, running version, a newer download; dropped: 0.0.1
+        let left: Vec<String> = kept_installers().iter().map(|v| v.to_string()).collect();
+        assert_eq!(left, ["0.0.2", cur, "99.0.0"]);
+        assert!(dl.join(installer_name("0.0.3")).exists()); // not ours to judge without a .sig
+
+        // handed over, but we are still the old version: wait out the grace, then failed
+        let s = UpdateState { phase: HANDED_OVER.into(), from: cur.into(), to: "99.1.0".into(), started: now(), ..Default::default() };
+        write_state(&s);
+        assert!(settle_state().unwrap().result.is_none());
+        write_state(&UpdateState { started: now() - INSTALL_GRACE_SECS - 1, ..s });
+        let got = settle_state().unwrap();
+        assert_eq!(got.result.as_deref(), Some("failed"));
+        assert!(got.message.contains("没有完成"), "{}", got.message);
+
+        // a state.json of the old updater (no "rollback" field) still parses
+        fs::write(state_path(), r#"{"phase":"done","from":"0.1.3","to":"0.1.4","result":"ok","message":"m","started":1,"updated":2,"acknowledged":true}"#).unwrap();
+        assert!(read_state().is_some_and(|s| !s.rollback));
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

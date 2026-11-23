@@ -94,8 +94,7 @@ found). It sends no data beyond a standard HTTP request. Turn it off in the ⌄ 
 
 ## Updates
 
-Plumb updates itself from this repo's GitHub Releases, with a dedicated updater modelled on
-[Longarm](https://github.com/lubobill1990/longarm)'s update service:
+Plumb updates itself from this repo's GitHub Releases:
 
 - **Check**: at start and every 6 hours, `latest.json` of the newest release. Only a
   strictly newer version is offered; never a downgrade.
@@ -105,16 +104,16 @@ Plumb updates itself from this repo's GitHub Releases, with a dedicated updater 
 - **Install when you say so**: the title bar shows "Plumb x.y.z 已就绪 · 重启更新". A
   restart ends every tab's process, so Plumb never restarts on its own and asks first
   when tabs are open.
-- **Dedicated updater**: `plumb.exe --updater`, run from a copy in
-  `%LOCALAPPDATA%\com.lubobill1990.plumb\updates`, waits for Plumb to exit, verifies the
-  installer again, backs up the install, installs silently, checks the installed version,
-  starts it and waits up to 60 s for it to report healthy.
-- **Rollback**: if any step after the backup fails (installer error, wrong version, the
-  new version crashes or never reports healthy) the backup is restored and the previous
-  version started. The launcher (⌄ menu) also offers "回滚到 <previous version>".
-- **Monitoring**: every phase is written to `updates\state.json` and `updates\update.log`;
-  the next start of Plumb shows the outcome (updated / rolled back / failed) and the
-  launcher opens the log.
+- **The installer installs**: Plumb verifies the installer again, starts it silently
+  (`/S /R`) and exits; the installer closes Plumb, installs and starts the new version.
+  Plumb never runs a copy of itself or moves its own files: its earlier updater program
+  (`plumb.exe --updater` run from AppData, backing up by moving the install dir) got the
+  unsigned exe convicted by Defender's ML (Trojan:Win32/Bearfoos) and quarantined.
+- **Rollback**: the installer of the previous version is kept (and verified again); the
+  launcher (⌄ menu) offers "回滚到 <previous version>", which reinstalls it.
+- **Monitoring**: the hand-over is written to `updates\state.json` and
+  `updates\update.log`; the next start of Plumb checks it is the version that was to be
+  installed, shows the outcome (updated / failed), and the launcher opens the log.
 
 ## Releasing
 
@@ -125,4 +124,4 @@ Plumb updates itself from this repo's GitHub Releases, with a dedicated updater 
 
 Signing needs the repo secrets `TAURI_SIGNING_PRIVATE_KEY` and
 `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` (the updater key; its public half is
-`src-tauri/updater.pub`). The updater E2E test is in `scripts/updater-e2e`.
+`src-tauri/updater.pub`).

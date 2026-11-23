@@ -450,7 +450,7 @@ async fn update_download(on_progress: Channel<DownloadProgress>) -> Result<Strin
     .map_err(|e| e.to_string())?
 }
 
-/// Hand over to the updater program and quit (all windows).
+/// Hand over to the installer and quit (all windows); it starts the new version.
 #[tauri::command]
 fn update_apply(app: AppHandle, version: String) -> Result<(), String> {
     update::start_apply(&version)?;
@@ -465,9 +465,10 @@ fn update_rollback(app: AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// The last update, settled (did the installer we handed over to do its job?).
 #[tauri::command]
 fn update_state() -> Option<update::UpdateState> {
-    update::read_state()
+    update::settle_state()
 }
 
 #[tauri::command]
