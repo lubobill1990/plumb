@@ -93,6 +93,13 @@ class Tab {
   customTitle: string | null = null;
   color: string | null = null;
   private lastInput = { data: "", at: 0 };
+  /**
+   * Input produced while pty_spawn is still in flight (id not known yet). Output can
+   * arrive on the channel before the invoke resolves, and ConPTY opens with a cursor
+   * position query (ESC[6n) that blocks the shell until answered: dropping xterm's
+   * reply left the tab blank forever. Held here and sent once the id is known.
+   */
+  private pendingInput: string[] | null = null;
 
   constructor(public profile: Profile, public cwd: string | null = null) {
     this.title = this.autoTitle = profile.name;
@@ -322,6 +329,7 @@ ${this.cwd}` : this.title;
 
   async spawn() {
     this.fit.fit();
+    this.pendingInput = [];
     try {
       this.id = await invoke<number>("pty_spawn", {
         program: this.profile.program,
@@ -331,7 +339,11 @@ ${this.cwd}` : this.title;
         rows: this.term.rows,
         onEvent: this.channel(),
       });
+      const queued = this.pendingInput.join("");
+      this.pendingInput = null;
+      if (queued) this.write(queued);
     } catch (err) {
+      this.pendingInput = null;
       this.exited = true;
       this.term.write(`\x1b[31m${err}\x1b[0m\r\n`);
     }
@@ -371,7 +383,8 @@ ${this.cwd}` : this.title;
   }
 
   write(data: string) {
-    if (this.id !== null) void invoke("pty_write", { id: this.id, data }).catch(() => {});
+    if (this.pendingInput) this.pendingInput.push(data);
+    else if (this.id !== null) void invoke("pty_write", { id: this.id, data }).catch(() => {});
   }
 
   onKey(e: KeyboardEvent): boolean {
