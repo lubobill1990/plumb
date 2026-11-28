@@ -1,5 +1,6 @@
 # Plumb updater E2E on a worker: install 0.1.2, update / roll back / reject, check every result.
 $ErrorActionPreference = 'Stop'
+$env:PLUMB_UPDATER_NO_ALERT = '1'   # the updater logs instead of showing a dialog nobody clicks
 $pk  = Join-Path $HOME 'plumb-e2e\pkgs'
 $ins = Join-Path $env:LOCALAPPDATA 'Plumb'
 $upd = Join-Path $env:LOCALAPPDATA 'com.lubobill1990.plumb\updates'
